@@ -1,0 +1,26 @@
+[package]
+name = "pypilot-controller-board"
+version = "0.1.0"
+authors = ["Greg Green <ggreen@bit-builder.com>"]
+edition = "2018"
+
+[dependencies]
+ufmt = "0.1.0"
+
+[dependencies.avr-device]
+rev = "0.3.0"
+features = ["atmega328p"]
+
+[dependencies.avr-hal-generic]
+git = "https://github.com/Rahix/avr-hal"
+rev = "885e8ec6d6d2fe34f26a1e2697a99f41092f0985"
+
+[dependencies.atmega328p-hal]
+git = "https://github.com/Rahix/avr-hal"
+rev = "885e8ec6d6d2fe34f26a1e2697a99f41092f0985"
+features = ["rt", "atmega328p", "adc-pins"]
+
+[dev-dependencies]
+panic-halt = "0.2.0"
+nb = "1.0.0"
+

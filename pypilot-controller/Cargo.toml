@@ -1,0 +1,43 @@
+[package]
+name = "pypilot-controller"
+version = "0.1.0"
+authors = ["Greg Green <ggreen@bit-builder.com>"]
+edition = "2018"
+license = "GPL-3.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+motor_temp = []
+controller_temp = []
+rudder_angle = []
+
+[dependencies]
+panic-halt = "0.2.0"
+ufmt = "0.1.0"
+avr-device = "0.3.0"
+nb = "1.0.0"
+
+[dependencies.pypilot-controller-board]
+version = "0.1.0"
+path = "../pypilot_controller_board"
+
+[dependencies.avr-hal-generic]
+git = "https://github.com/Rahix/avr-hal"
+rev = "885e8ec6d6d2fe34f26a1e2697a99f41092f0985"
+
+[dependencies.atmega328p-hal]
+git = "https://github.com/Rahix/avr-hal"
+rev = "885e8ec6d6d2fe34f26a1e2697a99f41092f0985"
+features = ["atmega328p"]
+
+[profile.dev]
+panic = "abort"
+lto = true
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+debug = true
+lto = true
+opt-level = "s"
