@@ -76,6 +76,18 @@ enum AdcChannel {
     Rudder,
 }
 
+impl From<AdcChannel> for usize {
+    fn from(original: AdcChannel) -> usize {
+        match original {
+            AdcChannel::Current => 0,
+            AdcChannel::Voltage => 1,
+            AdcChannel::ControllerTemp => 2,
+            AdcChannel::MotorTemp => 3,
+            AdcChannel::Rudder => 4,
+        }
+    }
+}
+
 /// struct for storing data for adc channel sample moving averages
 struct AdcMvgAvg {
     total: [u32; 2],
@@ -95,13 +107,7 @@ impl AdcResults {
     /// convert the selected channel to an index into data array
     #[inline]
     fn selected_channel(&self) -> usize {
-        match self.selected {
-            AdcChannel::Current => 0,
-            AdcChannel::Voltage => 1,
-            AdcChannel::ControllerTemp => 2,
-            AdcChannel::MotorTemp => 3,
-            AdcChannel::Rudder => 4,
-        }
+        self.selected.into()
     }
 
     #[inline]
@@ -170,6 +176,70 @@ impl AdcResults {
                 sel = nxt;
             }
         }
+    }
+
+    /// count the results in a channel array
+    fn count(&self, channel: AdcChannel, narray: usize) -> u16 {
+        let i: usize = channel.into();
+        self.data[i].count[narray]
+    }
+
+    /// get result in a channel array
+    fn take(&mut self, channel: AdcChannel, narray: usize) -> u16 {
+        let i: usize = channel.into();
+        let (cnt, val) = interrupt::free(|_cs| {
+            let cnt = self.data[i].count[narray];
+            let val = self.data[i].total[narray];
+            self.data[i].total[narray] = 0;
+            self.data[i].count[narray] = 0;
+            (cnt, val)
+        });
+        if cnt == 0 {
+            0
+        } else {
+            let avg: u32 = 16 * val / cnt as u32;
+            avg as u16
+        }
+    }
+
+    /// get current from channel array
+    fn take_amps(&mut self, narray: usize) -> u16 {
+        let v = self.take(AdcChannel::Current, narray);
+        v * 9 / 34 / 16
+    }
+
+    /// get voltage from channel array
+    fn take_volts(&mut self, narray: usize) -> u16 {
+        // voltage in 10mV increments 1.1ref, 560 and 10k resistors
+        let v = self.take(AdcChannel::Voltage, narray);
+        v * 1790 / 896 / 16
+    }
+
+    /// convert a raw mvg avg value to thermistor temperature
+    #[cfg(any(feature = "controller_temp", feature = "motor_temp"))]
+    fn thermistor_conversion(&self, raw: u32) -> u16 {
+        let r = 100061 * raw / (74464 - raw);
+        (30000000 / (r + 2600) + 200) as u16
+    }
+
+    /// get controller temperature from channel array
+    #[cfg(feature = "controller_temp")]
+    fn take_controller_temp(&mut self, narray: usize) -> u16 {
+        let v: u32 = self.take(AdcChannel::ControllerTemp, narray).into();
+        self.thermistor_conversion(v)
+    }
+
+    /// get motor temperature from channel array
+    #[cfg(feature = "motor_temp")]
+    fn take_motor_temp(&mut self, narray: usize) -> u16 {
+        let v: u32 = self.take(AdcChannel::MotorTemp, narray).into();
+        self.thermistor_conversion(v)
+    }
+
+    /// get rudder from channel array
+    #[cfg(feature = "rudder_angle")]
+    fn take_rudder(&mut self, narray: usize) -> u16 {
+        self.take(AdcChannel::Rudder, narray) * 4
     }
 }
 
@@ -466,11 +536,12 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
         #[cfg(debug_assertions)]
         w.prusart0().set_bit();
         w.prtim0().set_bit();
+        w.prtim2().set_bit();
         w.pradc().set_bit()
     });
 
     // set INTO interrupt
-    hdwr.exint.eimsk.modify(|_, w| w.int0().set_bit());
+    //hdwr.exint.eimsk.modify(|_, w| w.int0().set_bit());
 
     // do the power down, if INT0 interrupt hasn't happened
     // no other interrupts are important, as the Pi will
@@ -495,13 +566,14 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
     }
 
     // stop INTO interrupt
-    hdwr.exint.eimsk.modify(|_, w| w.int0().clear_bit());
+    //hdwr.exint.eimsk.modify(|_, w| w.int0().clear_bit());
 
     // turn on clocks
     hdwr.cpu.prr.modify(|_, w| {
         #[cfg(debug_assertions)]
         w.prusart0().clear_bit();
         w.prtim0().clear_bit();
+        w.prtim2().clear_bit();
         w.pradc().clear_bit()
     });
 
@@ -846,16 +918,6 @@ fn ADC() {
         // magic address
         const ADCSRA_REG: u8 = 0x7A;
         ptr::write_volatile(ADCSRA_REG as *mut u8, 0xC8);
-    }
-}
-
-//==========================================================
-
-// interrupt handler for INT0
-#[interrupt(atmega328p)]
-fn INT0() {
-    unsafe {
-        core::ptr::write_volatile(&mut PENDINGINT0, true);
     }
 }
 
