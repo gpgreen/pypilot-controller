@@ -30,6 +30,11 @@ git = "https://github.com/Rahix/avr-hal"
 rev = "885e8ec6d6d2fe34f26a1e2697a99f41092f0985"
 features = ["atmega328p"]
 
+# the following is a hack for link error during debug builds
+# rust-lang/compiler-builtins#347
+[profile.dev.package.compiler_builtins]
+overflow-checks = false
+
 [profile.dev]
 panic = "abort"
 lto = true

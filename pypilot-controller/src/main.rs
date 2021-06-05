@@ -19,10 +19,14 @@ use pypilot_controller_board::pwm::Timer0Pwm;
 #[cfg(debug_assertions)]
 use ufmt;
 
+// modules from project
+
+mod crc;
+mod packet;
+use packet::{OutgoingPacketState, OUT_SYNC_STATE};
+
 #[cfg(debug_assertions)]
 mod serial;
-#[cfg(debug_assertions)]
-use serial::{process_packet, process_serial};
 
 mod utility;
 #[cfg(debug_assertions)]
@@ -43,6 +47,7 @@ const MINRUDDERFAULT: u16 = 256;
 const MAXRUDDERFAULT: u16 = 512;
 const CURRENTRANGE: u16 = 1024;
 const BADFUSES: u16 = 2048;
+const REBOOTED: u16 = 32768;
 
 //==========================================================
 
@@ -61,6 +66,7 @@ pub enum CommandToExecute {
     Engage,
     Disengage,
     ProcessPacket([u8; 3]),
+    SendPacket([u8; 3]),
     None,
 }
 
@@ -68,7 +74,7 @@ pub enum CommandToExecute {
 
 /// adc channels being monitored
 #[derive(Copy, Clone)]
-enum AdcChannel {
+pub enum AdcChannel {
     Current,
     Voltage,
     ControllerTemp,
@@ -97,7 +103,7 @@ struct AdcMvgAvg {
 /** struct to hold adc samples for each channel, which channel is
 currently being sampled
 */
-struct AdcResults {
+pub struct AdcResults {
     enabled: u8,
     selected: AdcChannel,
     data: [AdcMvgAvg; 5],
@@ -179,7 +185,7 @@ impl AdcResults {
     }
 
     /// count the results in a channel array
-    fn count(&self, channel: AdcChannel, narray: usize) -> u16 {
+    pub fn count(&self, channel: AdcChannel, narray: usize) -> u16 {
         let i: usize = channel.into();
         self.data[i].count[narray]
     }
@@ -203,13 +209,13 @@ impl AdcResults {
     }
 
     /// get current from channel array
-    fn take_amps(&mut self, narray: usize) -> u16 {
+    pub fn take_amps(&mut self, narray: usize) -> u16 {
         let v = self.take(AdcChannel::Current, narray);
         v * 9 / 34 / 16
     }
 
     /// get voltage from channel array
-    fn take_volts(&mut self, narray: usize) -> u16 {
+    pub fn take_volts(&mut self, narray: usize) -> u16 {
         // voltage in 10mV increments 1.1ref, 560 and 10k resistors
         let v = self.take(AdcChannel::Voltage, narray);
         v * 1790 / 896 / 16
@@ -224,21 +230,21 @@ impl AdcResults {
 
     /// get controller temperature from channel array
     #[cfg(feature = "controller_temp")]
-    fn take_controller_temp(&mut self, narray: usize) -> u16 {
+    pub fn take_controller_temp(&mut self, narray: usize) -> u16 {
         let v: u32 = self.take(AdcChannel::ControllerTemp, narray).into();
         self.thermistor_conversion(v)
     }
 
     /// get motor temperature from channel array
     #[cfg(feature = "motor_temp")]
-    fn take_motor_temp(&mut self, narray: usize) -> u16 {
+    pub fn take_motor_temp(&mut self, narray: usize) -> u16 {
         let v: u32 = self.take(AdcChannel::MotorTemp, narray).into();
         self.thermistor_conversion(v)
     }
 
     /// get rudder from channel array
     #[cfg(feature = "rudder_angle")]
-    fn take_rudder(&mut self, narray: usize) -> u16 {
+    pub fn take_rudder(&mut self, narray: usize) -> u16 {
         self.take(AdcChannel::Rudder, narray) * 4
     }
 }
@@ -317,15 +323,20 @@ pub struct Hardware {
 fn main() -> ! {
     let mut hdwr = setup();
     loop {
-        hdwr = process_serial(hdwr);
+        hdwr = serial::process_serial(hdwr);
         hdwr = match hdwr.pending_cmd {
-            CommandToExecute::ProcessPacket(pkt) => process_packet(pkt, hdwr),
+            CommandToExecute::ProcessPacket(pkt) => packet::process_packet(pkt, hdwr),
             _ => hdwr,
         };
         hdwr = match hdwr.pending_cmd {
             CommandToExecute::Stop => stop(hdwr),
             _ => hdwr,
         };
+        unsafe {
+            if OUT_SYNC_STATE == OutgoingPacketState::Build {
+                hdwr = packet::build_outgoing(hdwr);
+            }
+        }
         hdwr = process_fsm(hdwr);
     }
 }
