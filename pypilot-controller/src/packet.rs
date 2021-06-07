@@ -254,8 +254,7 @@ pub fn process_packet(pkt: [u8; 3], mut hdwr: Hardware) -> Hardware {
         inb_pin: hdwr.inb_pin,
         pwm_pin: hdwr.pwm_pin,
         adc: hdwr.adc,
-        a1: hdwr.a1,
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "serial_packets"))]
         serial: hdwr.serial,
         machine_state: hdwr.machine_state,
         prev_state: hdwr.prev_state,
@@ -290,6 +289,7 @@ pub enum OutgoingPacketState {
     Byte0,
     Byte1,
     Byte2,
+    #[cfg(not(feature = "serial_packets"))]
     Sent,
 }
 
@@ -357,8 +357,7 @@ pub fn build_outgoing(mut hdwr: Hardware) -> Hardware {
         inb_pin: hdwr.inb_pin,
         pwm_pin: hdwr.pwm_pin,
         adc: hdwr.adc,
-        a1: hdwr.a1,
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "serial_packets"))]
         serial: hdwr.serial,
         machine_state: hdwr.machine_state,
         prev_state: hdwr.prev_state,

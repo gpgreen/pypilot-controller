@@ -10,7 +10,7 @@ use avr_device::interrupt;
 use core::cell::RefCell;
 use core::convert::TryInto;
 use core::ptr;
-use hal::port::mode::{Analog, Floating, Input, Output, Pwm};
+use hal::port::mode::{Floating, Input, Output, Pwm};
 use pypilot_controller_board::hal;
 use pypilot_controller_board::prelude::*;
 use pypilot_controller_board::pwm;
@@ -20,14 +20,11 @@ use pypilot_controller_board::pwm::Timer0Pwm;
 use ufmt;
 
 // modules from project
-
 mod crc;
 mod packet;
 use packet::{OutgoingPacketState, OUT_SYNC_STATE};
-
-#[cfg(debug_assertions)]
+#[cfg(feature = "serial_packets")]
 mod serial;
-
 mod utility;
 #[cfg(debug_assertions)]
 use utility::*;
@@ -94,15 +91,13 @@ impl From<AdcChannel> for usize {
     }
 }
 
-/// struct for storing data for adc channel sample moving averages
+/// adc sample moving averages
 struct AdcMvgAvg {
     total: [u32; 2],
     count: [u16; 2],
 }
 
-/** struct to hold adc samples for each channel, which channel is
-currently being sampled
-*/
+/// adc sample data for each channel, selected channel, enabled channels
 pub struct AdcResults {
     enabled: u8,
     selected: AdcChannel,
@@ -110,12 +105,32 @@ pub struct AdcResults {
 }
 
 impl AdcResults {
+    /// setup the array, used for setting the enable flags
+    fn setup(&mut self) {
+        // setup the enabled flags, if it hasn't yet been done
+        if self.enabled == 0 {
+            // Current and Voltage are always on
+            let mut enabled_flags = 0x3;
+            if cfg!(controller_temp) {
+                enabled_flags |= 0x4;
+            }
+            if cfg!(motor_temp) {
+                enabled_flags |= 0x8;
+            }
+            if cfg!(rudder_angle) {
+                enabled_flags |= 0x10;
+            }
+            self.enabled = enabled_flags;
+        }
+    }
+
     /// convert the selected channel to an index into data array
     #[inline]
     fn selected_channel(&self) -> usize {
         self.selected.into()
     }
 
+    /// is a channel enabled
     #[inline]
     fn is_channel_enabled(&self, channel: AdcChannel) -> bool {
         match channel {
@@ -150,21 +165,6 @@ impl AdcResults {
     /// switch to the next adc channel
     #[inline]
     fn next_channel(&mut self) {
-        // setup the enabled flags, if it hasn't yet been done
-        if self.enabled == 0 {
-            // Current and Voltage are always on
-            let mut enabled_flags = 0x3;
-            if cfg!(controller_temp) {
-                enabled_flags |= 0x4;
-            }
-            if cfg!(motor_temp) {
-                enabled_flags |= 0x8;
-            }
-            if cfg!(rudder_angle) {
-                enabled_flags |= 0x10;
-            }
-            self.enabled = enabled_flags;
-        }
         // get the next 'enabled' channel
         let mut sel = self.selected;
         loop {
@@ -208,13 +208,13 @@ impl AdcResults {
         }
     }
 
-    /// get current from channel array
+    /// get current from sample data
     pub fn take_amps(&mut self, narray: usize) -> u16 {
         let v = self.take(AdcChannel::Current, narray);
         v * 9 / 34 / 16
     }
 
-    /// get voltage from channel array
+    /// get voltage from sample data
     pub fn take_volts(&mut self, narray: usize) -> u16 {
         // voltage in 10mV increments 1.1ref, 560 and 10k resistors
         let v = self.take(AdcChannel::Voltage, narray);
@@ -228,21 +228,21 @@ impl AdcResults {
         (30000000 / (r + 2600) + 200) as u16
     }
 
-    /// get controller temperature from channel array
+    /// get controller temperature from sample data
     #[cfg(feature = "controller_temp")]
     pub fn take_controller_temp(&mut self, narray: usize) -> u16 {
         let v: u32 = self.take(AdcChannel::ControllerTemp, narray).into();
         self.thermistor_conversion(v)
     }
 
-    /// get motor temperature from channel array
+    /// get motor temperature from sample data
     #[cfg(feature = "motor_temp")]
     pub fn take_motor_temp(&mut self, narray: usize) -> u16 {
         let v: u32 = self.take(AdcChannel::MotorTemp, narray).into();
         self.thermistor_conversion(v)
     }
 
-    /// get rudder from channel array
+    /// get rudder angle from sample data
     #[cfg(feature = "rudder_angle")]
     pub fn take_rudder(&mut self, narray: usize) -> u16 {
         self.take(AdcChannel::Rudder, narray) * 4
@@ -282,20 +282,20 @@ static mut ADC_RESULTS: AdcResults = AdcResults {
 
 //==========================================================
 
+/// the state variables for the firmware
 pub struct Hardware {
     // hardware stuff
     cpu: pypilot_controller_board::pac::CPU,
     exint: pypilot_controller_board::pac::EXINT,
     timer0: pypilot_controller_board::pwm::Timer0Pwm,
     timer2: pypilot_controller_board::pac::TC2,
-    adc: RefCell<pypilot_controller_board::adc::Adc>,
+    adc: RefCell<avr_device::atmega328p::ADC>,
     ena_pin: hal::port::portd::PD4<Input<Floating>>,
     enb_pin: hal::port::portd::PD5<Input<Floating>>,
     ina_pin: hal::port::portd::PD2<Output>,
     inb_pin: hal::port::portd::PD3<Output>,
     pwm_pin: hal::port::portd::PD6<Pwm<Timer0Pwm>>,
-    a1: hal::port::portc::PC1<Analog>,
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "serial_packets"))]
     serial: RefCell<pypilot_controller_board::Serial<Floating>>,
     // state stuff
     machine_state: (PyPilotStateMachine, PyPilotStateMachine),
@@ -342,12 +342,8 @@ fn main() -> ! {
 }
 
 //==========================================================
-// INT0 Flag
 
-static mut PENDINGINT0: bool = false;
-
-//==========================================================
-
+/// finite state machine state's
 #[derive(Copy, Clone, PartialEq)]
 enum PyPilotStateMachine {
     Start,
@@ -362,6 +358,7 @@ enum PyPilotStateMachine {
     PowerDown,
 }
 
+/// transition from one state to another, records previous state
 fn change_state(
     new_state: PyPilotStateMachine,
     state_memo: (PyPilotStateMachine, PyPilotStateMachine),
@@ -382,6 +379,7 @@ fn change_state(
 
 #[cfg(debug_assertions)]
 impl PyPilotStateMachine {
+    /// send the state to serial
     fn send(&self, serial: &mut pypilot_controller_board::Serial<Floating>) {
         let s = match self {
             PyPilotStateMachine::Start => r"Start",
@@ -399,6 +397,7 @@ impl PyPilotStateMachine {
     }
 }
 
+/// send the state transition to serial, new and previous states
 #[cfg(debug_assertions)]
 fn send_tuple(
     state: (PyPilotStateMachine, PyPilotStateMachine),
@@ -423,6 +422,7 @@ fn setup() -> Hardware {
         w.prtim1().set_bit();
         w.prtwi().set_bit()
     });
+    #[cfg(not(feature = "serial_packets"))]
     #[cfg(not(debug_assertions))]
     cpu.prr.modify(|_, w| w.prusart0().set_bit());
     // turn off analog comparator
@@ -432,10 +432,15 @@ fn setup() -> Hardware {
     // sort out the pins
     let mut pins = pypilot_controller_board::Pins::new(dp.PORTB, dp.PORTC, dp.PORTD);
 
-    // turn on pullups on unused pins (proto-board, no unused pins)
+    // turn on pullups on unused pins
+    pins.d7.into_pull_up_input(&mut pins.ddr);
+    pins.d8.into_pull_up_input(&mut pins.ddr);
+
     #[cfg(not(debug_assertions))]
+    #[cfg(not(feature = "serial_packets"))]
     let _rx = pins.rx.into_pull_up_input(&mut pins.ddr);
     #[cfg(not(debug_assertions))]
+    #[cfg(not(feature = "serial_packets"))]
     let _tx = pins.tx.into_pull_up_input(&mut pins.ddr);
 
     // turn on timer2
@@ -445,19 +450,27 @@ fn setup() -> Hardware {
     // pwm
     let mut timer0 = pwm::Timer0Pwm::new(dp.TC0, pwm::Prescaler::Prescale8);
     let pwm_pin = pins.d6.into_output(&mut pins.ddr).into_pwm(&mut timer0);
+    // clockwise
     let ina_pin = pins.d2.into_output(&mut pins.ddr);
+    // counterclockwise
     let inb_pin = pins.d3.into_output(&mut pins.ddr);
+
+    // half-bridge fault pins, also enable pins, but carrier has them pulled high
+    // already
+    let ena_pin = pins.d4.into_floating_input(&mut pins.ddr);
+    let enb_pin = pins.d5.into_floating_input(&mut pins.ddr);
 
     // SPI pins
     let _sck = pins.d13.into_pull_up_input(&mut pins.ddr);
     let _miso = pins.d12.into_output(&mut pins.ddr);
     let _mosi = pins.d11.into_pull_up_input(&mut pins.ddr);
     let _cs = pins.d10.into_pull_up_input(&mut pins.ddr);
+    let _can_int = pins.d9.into_floating_input(&mut pins.ddr);
 
     // now module setup
 
     // setup serial
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "serial_packets"))]
     let mut serial = pypilot_controller_board::Serial::<Floating>::new(
         dp.USART0,
         pins.rx,
@@ -465,14 +478,37 @@ fn setup() -> Hardware {
         57600.into_baudrate(),
     );
 
-    // setup adc, default is 128 clock division, and AVcc voltage reference
-    let mut adc = pypilot_controller_board::adc::Adc::new(dp.ADC, Default::default());
+    // setup adc, not using the HAL, because it doesn't do interrupts
+    let adc = dp.ADC;
+    adc.adcsra.write(|w| {
+        w.aden()
+            .set_bit()
+            .adsc()
+            .set_bit()
+            .adie()
+            .set_bit()
+            .adps()
+            .prescaler_128()
+    });
+    adc.didr0.write(|w| {
+        w.adc0d()
+            .set_bit()
+            .adc1d()
+            .set_bit()
+            .adc2d()
+            .set_bit()
+            .adc3d()
+            .set_bit()
+            .adc4d()
+            .set_bit()
+            .adc5d()
+            .set_bit()
+    });
 
-    // adc pins
-    let a1 = pins.a1.into_analog_input(&mut adc);
-
-    // enable interrupts
+    // setup adc_results, and enable interrupts
     unsafe {
+        // SAFETY: ok because interrupts aren't yet on
+        ADC_RESULTS.setup();
         interrupt::enable();
     }
 
@@ -494,14 +530,13 @@ fn setup() -> Hardware {
         exint: dp.EXINT,
         timer0: timer0,
         timer2: timer2,
-        ena_pin: pins.d4,
-        enb_pin: pins.d5,
+        ena_pin: ena_pin,
+        enb_pin: enb_pin,
         ina_pin: ina_pin,
         inb_pin: inb_pin,
         pwm_pin: pwm_pin,
         adc: RefCell::new(adc),
-        a1: a1,
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "serial_packets"))]
         serial: RefCell::new(serial),
         machine_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
         prev_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
@@ -532,36 +567,47 @@ fn setup() -> Hardware {
 /// power down the cpu
 fn power_down_mode(hdwr: Hardware) -> Hardware {
     // delay for a bit, so that usart can finish any transmission
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "serial_packets"))]
     pypilot_controller_board::delay_ms(10);
 
     // disable modules
-    // release hal adc which turns it off
-    let adcp = hdwr.adc.into_inner().release();
+    // adc off
+    hdwr.adc
+        .borrow_mut()
+        .adcsra
+        .write(|w| w.aden().clear_bit().adif().clear_bit());
+
     // release hal serial which turns it off
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "serial_packets"))]
     let (usart, rxpin, txpin) = hdwr.serial.into_inner().release();
 
     // turn off clocks
     hdwr.cpu.prr.modify(|_, w| {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "serial_packets"))]
         w.prusart0().set_bit();
+        w.prspi().set_bit();
         w.prtim0().set_bit();
         w.prtim2().set_bit();
         w.pradc().set_bit()
     });
 
-    // set INTO interrupt
-    //hdwr.exint.eimsk.modify(|_, w| w.int0().set_bit());
+    // set PCINT2 interrupt
+    unsafe {
+        hdwr.exint.pcicr.modify(|r, w| w.bits(r.bits() | 4));
+        // set RX pin interrupt (PD0 = PCINT16)
+        hdwr.exint.pcmsk2.modify(|r, w| w.bits(r.bits() | 1));
+    }
 
-    // do the power down, if INT0 interrupt hasn't happened
+    // do the power down, if PCINT2 interrupt hasn't happened
     // no other interrupts are important, as the Pi will
     // be powered off in this state, so only need
-    // to detect button pushes
+    // to detect receive activity
     hdwr.cpu.smcr.write(|w| w.sm().pdown());
     interrupt::disable();
     unsafe {
-        if !ptr::read_volatile(&PENDINGINT0) {
+        if !ptr::read_volatile(&PENDINGPCINT2) {
+            // set TCNT2 to 0
+            hdwr.timer2.tcnt2.write(|w| w.bits(0));
             // sleep enable
             hdwr.cpu.smcr.modify(|_, w| w.se().set_bit());
             interrupt::enable();
@@ -570,26 +616,39 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
             // sleep disable
             hdwr.cpu.smcr.modify(|_, w| w.se().clear_bit());
         } else {
-            // INT0 pending
-            ptr::write_volatile(&mut PENDINGINT0, false);
+            // PCINT2 pending
+            ptr::write_volatile(&mut PENDINGPCINT2, false);
         }
         interrupt::enable();
     }
 
-    // stop INTO interrupt
-    //hdwr.exint.eimsk.modify(|_, w| w.int0().clear_bit());
+    // stop PCINT2 interrupt
+    unsafe {
+        hdwr.exint.pcicr.modify(|r, w| w.bits(r.bits() & !4));
+        hdwr.exint.pcmsk2.modify(|r, w| w.bits(r.bits() & !1));
+    }
 
     // turn on clocks
     hdwr.cpu.prr.modify(|_, w| {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "serial_packets"))]
         w.prusart0().clear_bit();
+        w.prspi().clear_bit();
         w.prtim0().clear_bit();
         w.prtim2().clear_bit();
         w.pradc().clear_bit()
     });
 
     // enable modules
-    let newadc = pypilot_controller_board::adc::Adc::new(adcp, Default::default());
+    hdwr.adc.borrow_mut().adcsra.write(|w| {
+        w.aden()
+            .set_bit()
+            .adsc()
+            .set_bit()
+            .adie()
+            .set_bit()
+            .adps()
+            .prescaler_128()
+    });
     let newserial = pypilot_controller_board::Serial::<Floating>::new(
         usart,
         rxpin,
@@ -597,7 +656,7 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
         57600.into_baudrate(),
     );
 
-    // start adc and serial again
+    // reset serial cell, back to default values also
     Hardware {
         cpu: hdwr.cpu,
         exint: hdwr.exint,
@@ -608,9 +667,8 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
         ina_pin: hdwr.ina_pin,
         inb_pin: hdwr.inb_pin,
         pwm_pin: hdwr.pwm_pin,
-        adc: RefCell::new(newadc),
-        a1: hdwr.a1,
-        #[cfg(debug_assertions)]
+        adc: hdwr.adc,
+        #[cfg(any(debug_assertions, feature = "serial_packets"))]
         serial: RefCell::new(newserial),
         machine_state: hdwr.machine_state,
         prev_state: hdwr.prev_state,
@@ -674,8 +732,7 @@ fn position(mut hdwr: Hardware, value: u16) -> Hardware {
         inb_pin: hdwr.inb_pin,
         pwm_pin: hdwr.pwm_pin,
         adc: hdwr.adc,
-        a1: hdwr.a1,
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "serial_packets"))]
         serial: hdwr.serial,
         machine_state: hdwr.machine_state,
         prev_state: hdwr.prev_state,
@@ -701,14 +758,15 @@ fn position(mut hdwr: Hardware, value: u16) -> Hardware {
 
 /// the main state machine processer
 fn process_fsm(mut hdwr: Hardware) -> Hardware {
-    // first check the times
+    // first check the times, set do_update boolean
+    // if motor position should be updated
     let do_update = interrupt::free(|_cs| {
         let ticks = hdwr.timer2.tcnt2.read().bits();
         if ticks > 78 {
             hdwr.timeout += 1;
             hdwr.serial_data_timeout += 1;
             unsafe {
-                hdwr.timer2.tcnt2.write(|w| w.bits(ticks - 78));
+                hdwr.timer2.tcnt2.modify(|r, w| w.bits(r.bits() - 78));
             }
             true
         } else {
@@ -836,7 +894,7 @@ fn process_fsm(mut hdwr: Hardware) -> Hardware {
             }
         }
         PyPilotStateMachine::PowerDown => {
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "serial_packets"))]
             hdwr.serial.borrow_mut().flush();
             // cpu goes to sleep, then woken up
             hdwr = power_down_mode(hdwr);
@@ -860,8 +918,7 @@ fn process_fsm(mut hdwr: Hardware) -> Hardware {
         inb_pin: hdwr.inb_pin,
         pwm_pin: hdwr.pwm_pin,
         adc: hdwr.adc,
-        a1: hdwr.a1,
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "serial_packets"))]
         serial: hdwr.serial,
         machine_state: newstate,
         prev_state: hdwr.prev_state,
@@ -885,7 +942,17 @@ fn process_fsm(mut hdwr: Hardware) -> Hardware {
 
 //==========================================================
 
-// interrupt handler for ADC complete
+static mut PENDINGPCINT2: bool = false;
+
+#[interrupt(atmega328p)]
+fn PCINT2() {
+    unsafe {
+        ptr::write_volatile(&mut PENDINGPCINT2, true);
+    }
+}
+
+//==========================================================
+
 #[interrupt(atmega328p)]
 fn ADC() {
     static mut SAMPLE_CNT: u8 = 0;
@@ -893,6 +960,8 @@ fn ADC() {
     // avr interrupts aren't nesting
     // we are modifying the ADC_RESULTS static structure
     // so can't reenable interrupts till this isr is finished
+    // we are using the raw pointer to ADC registers also, due
+    // to the same reason
     unsafe {
         // magic address
         const ADCW_REG: u16 = 0x78;

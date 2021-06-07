@@ -74,7 +74,7 @@ pub fn process_serial(mut hdwr: Hardware) -> Hardware {
                 Ok(_) => OutgoingPacketState::None,
                 Err(_) => OutgoingPacketState::None,
             },
-            // for serial, this will never happen
+            #[cfg(not(feature = "serial_packets"))]
             OutgoingPacketState::Sent => OutgoingPacketState::None,
         };
     }
@@ -89,8 +89,6 @@ pub fn process_serial(mut hdwr: Hardware) -> Hardware {
         inb_pin: hdwr.inb_pin,
         pwm_pin: hdwr.pwm_pin,
         adc: hdwr.adc,
-        a1: hdwr.a1,
-        #[cfg(debug_assertions)]
         serial: hdwr.serial,
         machine_state: hdwr.machine_state,
         prev_state: hdwr.prev_state,
