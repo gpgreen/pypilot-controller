@@ -33,6 +33,11 @@ pub enum PacketType {
     FlagsCode,
     EEPROMValueCode,
     InvalidCode,
+    // debugging codes
+    #[cfg(debug_assertions)]
+    CurrentFSM,
+    #[cfg(debug_assertions)]
+    PreviousFSM,
 }
 
 /// convert to u8
@@ -60,6 +65,10 @@ impl From<PacketType> for u8 {
             PacketType::FlagsCode => 0x8f,
             PacketType::EEPROMValueCode => 0x9a,
             PacketType::InvalidCode => 0x00,
+            #[cfg(debug_assertions)]
+            PacketType::CurrentFSM => 0x20,
+            #[cfg(debug_assertions)]
+            PacketType::PreviousFSM => 0x21,
         }
     }
 }
@@ -94,6 +103,10 @@ impl TryFrom<u8> for PacketType {
             0xa7 => Ok(PacketType::RudderSenseCode),
             0x8f => Ok(PacketType::FlagsCode),
             0x9a => Ok(PacketType::EEPROMValueCode),
+            #[cfg(debug_assertions)]
+            0x20 => Ok(PacketType::CurrentFSM),
+            #[cfg(debug_assertions)]
+            0x21 => Ok(PacketType::PreviousFSM),
             n => Err(ParseError::InvalidPacketType(n)),
         }
     }
@@ -218,7 +231,7 @@ pub fn process_packet(pkt: [u8; 3], mut hdwr: Hardware) -> Hardware {
             }
             PacketType::MaxSlewCode => {
                 hdwr.max_slew_speed = pkt[1];
-                hdwr.max_slew_speed = pkt[2];
+                hdwr.max_slew_slow = pkt[2];
                 // if set at the end of the rage (up to 255) no slew limit
                 if hdwr.max_slew_speed > 250 {
                     hdwr.max_slew_speed = 250;
@@ -237,7 +250,7 @@ pub fn process_packet(pkt: [u8; 3], mut hdwr: Hardware) -> Hardware {
             PacketType::EEPROMReadCode => {}
             PacketType::EEPROMWriteCode => {}
             PacketType::ReprogramCode => {}
-            PacketType::ResetCode => {}
+            PacketType::ResetCode => hdwr.flags &= !OVERCURRENTFAULT,
             PacketType::RudderRangeCode => {}
             _ => {}
         },

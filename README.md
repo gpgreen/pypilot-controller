@@ -40,18 +40,23 @@ avrdude -p atmega328p -c <your programmer here> -U lfuse:w:0xc2:m -U hfuse:w:0xd
 
 ## Firmware Load
 
+To create the hex file, use the script 'mkhex.sh' in the
+pypilot-controller directory:
+```
+cd <git working dir>/pypilot-controller
+./mkhex.sh --debug pypilot-controller
+```
+The resulting hex file is in the target directory.
+
 The compiled firmware (pypilot-controller.hex) can be programmed into the hardware using
 ```
 avrdude -p atmega328p -c <your programmer here> -U flash:w:pypilot-controller.hex
 ```
 
-To create the hex file, use avr-objcopy
+Or, use the script 'program.sh' in the pypilot-controller directory:
 ```
-avr-objcopy -O ihex target/avr-atmega328p/release/pypilot-controller.elf pypilot-controller.hex
+./program.sh pypilot-controller
 ```
-
-This can also be done with the makefile target 'program', or `make
-program`
 
 ## PyPilot Controller Hardware Changes
 

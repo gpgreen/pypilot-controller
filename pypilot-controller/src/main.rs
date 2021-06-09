@@ -16,18 +16,13 @@ use pypilot_controller_board::prelude::*;
 use pypilot_controller_board::pwm;
 use pypilot_controller_board::pwm::Timer0Pwm;
 
-#[cfg(debug_assertions)]
-use ufmt;
-
 // modules from project
 mod crc;
+use crc::crc8;
 mod packet;
-use packet::{OutgoingPacketState, OUT_SYNC_STATE};
+use packet::{OutgoingPacketState, PacketType, OUT_SYNC_STATE};
 #[cfg(feature = "serial_packets")]
 mod serial;
-mod utility;
-#[cfg(debug_assertions)]
-use utility::*;
 
 //==========================================================
 // Hardware.flags property masks
@@ -380,20 +375,19 @@ fn change_state(
 #[cfg(debug_assertions)]
 impl PyPilotStateMachine {
     /// send the state to serial
-    fn send(&self, serial: &mut pypilot_controller_board::Serial<Floating>) {
-        let s = match self {
-            PyPilotStateMachine::Start => r"Start",
-            PyPilotStateMachine::WaitEntry => r"WaitEntry",
-            PyPilotStateMachine::Wait => r"Wait",
-            PyPilotStateMachine::Engage => r"Engage",
-            PyPilotStateMachine::Operational => r"Operational",
-            PyPilotStateMachine::DisengageEntry => r"DisengageEntry",
-            PyPilotStateMachine::Disengage => r"Disengage",
-            PyPilotStateMachine::DetachEntry => r"DetachEntry",
-            PyPilotStateMachine::Detach => r"Detach",
-            PyPilotStateMachine::PowerDown => r"PowerDown",
-        };
-        ufmt::uwrite!(serial, "{}", s).void_unwrap();
+    fn send(&self) -> u8 {
+        match self {
+            PyPilotStateMachine::Start => 0x00,
+            PyPilotStateMachine::WaitEntry => 0x01,
+            PyPilotStateMachine::Wait => 0x02,
+            PyPilotStateMachine::Engage => 0x03,
+            PyPilotStateMachine::Operational => 0x04,
+            PyPilotStateMachine::DisengageEntry => 0x05,
+            PyPilotStateMachine::Disengage => 0x06,
+            PyPilotStateMachine::DetachEntry => 0x07,
+            PyPilotStateMachine::Detach => 0x08,
+            PyPilotStateMachine::PowerDown => 0x09,
+        }
     }
 }
 
@@ -403,11 +397,20 @@ fn send_tuple(
     state: (PyPilotStateMachine, PyPilotStateMachine),
     serial: &mut pypilot_controller_board::Serial<Floating>,
 ) {
-    ufmt::uwrite!(serial, "Current:").void_unwrap();
-    state.0.send(serial);
-    ufmt::uwrite!(serial, " Previous:").void_unwrap();
-    state.1.send(serial);
-    ufmt::uwriteln!(serial, "\r").void_unwrap();
+    let ty = PacketType::CurrentFSM.into();
+    let pkt: [u8; 3] = [ty, 0x00, state.0.send()];
+    let crc = crc8(pkt);
+    for b in pkt.iter() {
+        serial.write_byte(*b);
+    }
+    serial.write_byte(crc);
+    let ty = PacketType::PreviousFSM.into();
+    let pkt = [ty, 0x00, state.1.send()];
+    let crc = crc8(pkt);
+    for b in pkt.iter() {
+        serial.write_byte(*b);
+    }
+    serial.write_byte(crc);
 }
 
 //==========================================================
@@ -471,7 +474,7 @@ fn setup() -> Hardware {
 
     // setup serial
     #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    let mut serial = pypilot_controller_board::Serial::<Floating>::new(
+    let serial = pypilot_controller_board::Serial::<Floating>::new(
         dp.USART0,
         pins.rx,
         pins.tx.into_output(&mut pins.ddr),
@@ -511,19 +514,6 @@ fn setup() -> Hardware {
         ADC_RESULTS.setup();
         interrupt::enable();
     }
-
-    // print out some status
-    #[cfg(debug_assertions)]
-    ufmt::uwriteln!(&mut serial, "\r\nPyPilot Controller Start\r").void_unwrap();
-
-    #[cfg(debug_assertions)]
-    ufmt::uwrite!(serial, "spcr:").void_unwrap();
-    #[cfg(debug_assertions)]
-    send_reg(&mut serial, 0x4c);
-    #[cfg(debug_assertions)]
-    ufmt::uwrite!(serial, "prr:").void_unwrap();
-    #[cfg(debug_assertions)]
-    send_reg(&mut serial, 0x64);
 
     Hardware {
         cpu: cpu,
