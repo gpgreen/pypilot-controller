@@ -19,7 +19,11 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# 
+#
+# Changes:
+#
+# ggreen@bit-builder - Modified values in table to match that of rust firmware
+
 """The crc8 module.
 
 The crc8 module provides the same interface as the hashlib module.

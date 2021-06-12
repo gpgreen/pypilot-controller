@@ -307,7 +307,6 @@ pub struct Hardware {
     max_motor_temp: u16,
     rudder_min: u16,
     rudder_max: u16,
-    serialin: u8,
     flags: u16,
     pending_cmd: CommandToExecute,
 }
@@ -398,14 +397,14 @@ fn send_tuple(
     serial: &mut pypilot_controller_board::Serial<Floating>,
 ) {
     let ty = PacketType::CurrentFSM.into();
-    let pkt: [u8; 3] = [ty, 0x00, state.0.send()];
+    let pkt: [u8; 3] = [ty, state.0.send(), 0x00];
     let crc = crc8(pkt);
     for b in pkt.iter() {
         serial.write_byte(*b);
     }
     serial.write_byte(crc);
     let ty = PacketType::PreviousFSM.into();
-    let pkt = [ty, 0x00, state.1.send()];
+    let pkt = [ty, state.1.send(), 0x00];
     let crc = crc8(pkt);
     for b in pkt.iter() {
         serial.write_byte(*b);
@@ -546,7 +545,6 @@ fn setup() -> Hardware {
         max_motor_temp: 7000,
         rudder_min: 0,
         rudder_max: 65535,
-        serialin: 0,
         flags: 0x00,
         pending_cmd: CommandToExecute::None,
     }
@@ -674,7 +672,6 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
         max_motor_temp: hdwr.max_motor_temp,
         rudder_min: hdwr.rudder_min,
         rudder_max: hdwr.rudder_max,
-        serialin: hdwr.serialin,
         flags: hdwr.flags,
         pending_cmd: CommandToExecute::None,
     }
@@ -738,7 +735,6 @@ fn position(mut hdwr: Hardware, value: u16) -> Hardware {
         max_motor_temp: hdwr.max_motor_temp,
         rudder_min: hdwr.rudder_min,
         rudder_max: hdwr.rudder_max,
-        serialin: hdwr.serialin,
         flags: hdwr.flags,
         pending_cmd: hdwr.pending_cmd,
     }
@@ -893,8 +889,8 @@ fn process_fsm(mut hdwr: Hardware) -> Hardware {
     };
     // check and see if machine state has changed, if so, send it via serial port
     if hdwr.prev_state.0 != hdwr.machine_state.0 || hdwr.prev_state.1 != hdwr.machine_state.1 {
-        #[cfg(debug_assertions)]
-        send_tuple(hdwr.machine_state, &mut hdwr.serial.borrow_mut());
+        /*        #[cfg(debug_assertions)]
+        send_tuple(hdwr.machine_state, &mut hdwr.serial.borrow_mut());*/
         hdwr.prev_state = hdwr.machine_state;
     }
     Hardware {
@@ -924,7 +920,6 @@ fn process_fsm(mut hdwr: Hardware) -> Hardware {
         max_motor_temp: hdwr.max_motor_temp,
         rudder_min: hdwr.rudder_min,
         rudder_max: hdwr.rudder_max,
-        serialin: hdwr.serialin,
         flags: hdwr.flags,
         pending_cmd: CommandToExecute::None,
     }

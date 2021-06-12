@@ -180,14 +180,10 @@ fn build_rudder_pkt() -> (bool, u16, PacketType) {
 pub fn process_packet(pkt: [u8; 3], mut hdwr: Hardware) -> Hardware {
     hdwr.flags |= SYNC;
     let mut val: u16 = pkt[1] as u16 | ((pkt[2] as u16) << 8);
-    let pkt_type = PacketType::try_from(pkt[0]);
-    match pkt_type {
+    match PacketType::try_from(pkt[0]) {
         Ok(ty) => match ty {
             PacketType::CommandCode => {
                 hdwr.timeout = 0;
-                if hdwr.serialin < 12 {
-                    hdwr.serialin += 4; // output at input rate
-                }
                 // check for valid range and none of these faults
                 if val <= 2000
                     && (hdwr.flags & (OVERTEMPFAULT | OVERCURRENTFAULT | BADVOLTAGEFAULT)) == 0
@@ -223,12 +219,7 @@ pub fn process_packet(pkt: [u8; 3], mut hdwr: Hardware) -> Hardware {
             }
             PacketType::RudderMinCode => hdwr.rudder_min = val,
             PacketType::RudderMaxCode => hdwr.rudder_max = val,
-            PacketType::DisengageCode => {
-                if hdwr.serialin < 12 {
-                    hdwr.serialin += 4; // output at input rate
-                }
-                hdwr.pending_cmd = CommandToExecute::Disengage;
-            }
+            PacketType::DisengageCode => hdwr.pending_cmd = CommandToExecute::Disengage,
             PacketType::MaxSlewCode => {
                 hdwr.max_slew_speed = pkt[1];
                 hdwr.max_slew_slow = pkt[2];
@@ -283,7 +274,6 @@ pub fn process_packet(pkt: [u8; 3], mut hdwr: Hardware) -> Hardware {
         max_motor_temp: hdwr.max_motor_temp,
         rudder_min: hdwr.rudder_min,
         rudder_max: hdwr.rudder_max,
-        serialin: hdwr.serialin,
         flags: hdwr.flags,
         pending_cmd: hdwr.pending_cmd,
     }
@@ -323,16 +313,13 @@ pub fn build_outgoing(mut hdwr: Hardware) -> Hardware {
                 hdwr.flags &= !REBOOTED;
                 (true, hdwr.flags, PacketType::FlagsCode)
             }
-            1 | 4 | 7 | 11 | 14 | 17 | 21 | 24 | 27 | 31 | 34 | 37 | 40 => {
-                interrupt::free(|_cs| {
-                    if ADC_RESULTS.count(AdcChannel::Current, 0) < 50 {
-                        (false, 0, PacketType::InvalidCode)
-                    } else {
-                        hdwr.serialin -= 4; // fix current output rate to input rate
-                        (true, ADC_RESULTS.take_amps(0), PacketType::CurrentCode)
-                    }
-                })
-            }
+            1 | 4 | 7 | 11 | 14 | 17 | 21 | 24 | 27 | 31 | 34 | 37 | 40 => interrupt::free(|_cs| {
+                if ADC_RESULTS.count(AdcChannel::Current, 0) < 50 {
+                    (false, 0, PacketType::InvalidCode)
+                } else {
+                    (true, ADC_RESULTS.take_amps(0), PacketType::CurrentCode)
+                }
+            }),
             3 | 13 | 23 | 33 => interrupt::free(|_cs| {
                 if ADC_RESULTS.count(AdcChannel::Voltage, 0) < 2 {
                     (false, 0, PacketType::InvalidCode)
@@ -350,13 +337,17 @@ pub fn build_outgoing(mut hdwr: Hardware) -> Hardware {
             // catch all the undefined ranges
             _ => (false, 0, PacketType::InvalidCode),
         };
-        OUT_SYNC_POS += 1;
         // check if outgoing packet is ready
         if use_it {
             OUT_BYTES[0] = code.into();
             OUT_BYTES[1] = (v & 0xFF) as u8;
             OUT_BYTES[2] = ((v & 0xFF00) >> 8) as u8;
             OUT_SYNC_STATE = OutgoingPacketState::Start;
+        }
+        if OUT_SYNC_POS < 41 {
+            OUT_SYNC_POS += 1;
+        } else {
+            OUT_SYNC_POS = 0;
         }
     }
     Hardware {
@@ -386,7 +377,6 @@ pub fn build_outgoing(mut hdwr: Hardware) -> Hardware {
         max_motor_temp: hdwr.max_motor_temp,
         rudder_min: hdwr.rudder_min,
         rudder_max: hdwr.rudder_max,
-        serialin: hdwr.serialin,
         flags: hdwr.flags,
         pending_cmd: hdwr.pending_cmd,
     }

@@ -11,6 +11,7 @@ import struct
 from tkinter import *
 from tkinter import ttk
 
+engaged = False
 msg = bytearray()
 
 def state_decode(state):
@@ -40,21 +41,41 @@ def state_decode(state):
 
 def handle_recvd_pkt(pkt):
     s = "recvd:{} Ok CRC".format(pkt.hex())
-    val = struct.unpack(">H", pkt[1:])[0]
+    val = struct.unpack("<H", pkt[1:])[0]
     print("code: {:x} val:{}".format(pkt[0], val))
     if pkt[0] == 0x20:
         s += "\nCurrent: " + state_decode(val)
     elif pkt[0] == 0x21:
         s += "\nPrevious: " + state_decode(val)
+    elif pkt[0] == 0x1c:
+        s += "\nCurrent: {}".format(val)
+    elif pkt[0] == 0xb3:
+        s += "\nVoltage: {}".format(val)
+    elif pkt[0] == 0xf9:
+        s += "\nController Temp: {}".format(val)
+    elif pkt[0] == 0x48:
+        s += "\nMotor Temp: {}".format(val)
+    elif pkt[0] == 0xa7:
+        s += "\nRudder Angle: {}".format(val)
+    elif pkt[0] == 0x8f:
+        s += "\nFlags: {:x}".format(val)
+    elif pkt[0] == 0x9a:
+        s += "\nEEPROMValue: {}".format(val)
     write_to_serial_widget(s + '\n')
     
     
 def build_pkt(typecode, value):
-    pkt = struct.pack(">BH", typecode, value)
+    pkt = struct.pack("<BH", typecode, value)
     crc = calc_crc8(pkt)
-    pkt = struct.pack(">BHB", typecode, value, crc[0])
+    pkt = struct.pack("<BHB", typecode, value, crc[0])
     return pkt
 
+def calc_crc8(msg):
+    hash = crc8.crc8(initial_start=0xFF)
+    hash.update(msg)
+    #print("crc8:0x{}".format(hash.hexdigest()))
+    return hash.digest()
+    
 def open_serial():
     global serial_port
     s = serial.Serial("/dev/ttyUSB0", 115200, timeout=0)
@@ -84,6 +105,7 @@ def poll_serial():
     global msg
     read_byte = serial_port.read()
     if len(read_byte) != 0:
+        print("ch:{}".format(read_byte.hex()))
         msg = msg + read_byte
         if len(msg) == 4:
             pkt = msg[:3]
@@ -92,20 +114,27 @@ def poll_serial():
                 handle_recvd_pkt(pkt)
                 msg = b''
             else:
+                print("bad crc:{}".format(pkt.hex()))
                 msg = msg[1:]
-    root.after(1, poll_serial)
+    if engaged:
+        update_position(position_scale.get())
+    root.after(20, poll_serial)
     
 def update_position(val):
-    print("Position:", val)
     pos = int(round(float(val) * 10))
     print("Position:", val, pos)
     try:
-        if serial_port and pos >= -2000 and pos <= 2000:
+        if serial_port and engaged and pos >= -2000 and pos <= 2000:
             pkt = build_pkt(0xc7, pos)
             send_packet(pkt)
     except NameError:
         # this happens when widget is initialized
         pass
+
+def engage():
+    global engaged
+    print("engage")
+    engaged = True
     
 def reset(*args):
     print("reset")
@@ -113,16 +142,12 @@ def reset(*args):
     send_packet(pkt)
 
 def disengage(*args):
+    global engaged
     print("disengage")
     pkt = build_pkt(0x68, 0)
     send_packet(pkt)
+    engaged = False
 
-def calc_crc8(msg):
-    hash = crc8.crc8(initial_start=0xFF)
-    hash.update(msg)
-    #print("crc8:0x{}".format(hash.hexdigest()))
-    return hash.digest()
-    
 root = Tk()
 root.title("pypilot-controller device test")
 
@@ -131,13 +156,13 @@ mainframe.grid(column=0, row=0, sticky=(N, W, E, S))
 root.columnconfigure(0, weight=1)
 root.rowconfigure(0, weight=1)
 
-position = StringVar()
 position_scale = ttk.Scale(mainframe, orient=HORIZONTAL, length=200, from_=0, to=200, command=update_position)
 position_scale.set(100)
 position_scale.grid(column=2, row=1, sticky=(W, E))
 
-ttk.Button(mainframe, text="Reset", command=reset).grid(column=1, row=2, sticky=W)
+ttk.Button(mainframe, text="Engage", command=engage).grid(column=1, row=2, sticky=W)
 ttk.Button(mainframe, text="Disengage", command=disengage).grid(column=2, row=2, sticky=W)
+ttk.Button(mainframe, text="Reset", command=reset).grid(column=3, row=2, sticky=W)
 
 flags = StringVar()
 ttk.Label(mainframe, textvariable=flags).grid(column=1, row=3, sticky=(W, E))
@@ -158,7 +183,7 @@ position_scale.focus()
 #root.bind("<Return>", calculate)
 
 open_serial()
-root.after(1, poll_serial)
+root.after(20, poll_serial)
 
 root.mainloop()
 close_serial()
