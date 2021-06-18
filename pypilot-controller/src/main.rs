@@ -18,9 +18,8 @@ use pypilot_controller_board::pwm::Timer0Pwm;
 
 // modules from project
 mod crc;
-use crc::crc8;
 mod packet;
-use packet::{OutgoingPacketState, PacketType, OUT_SYNC_STATE};
+use packet::OutgoingPacketState;
 #[cfg(feature = "serial_packets")]
 mod serial;
 
@@ -52,7 +51,7 @@ const LOWCURRENT: bool = true;
 /// in a function that changes hardware state variables,
 /// use this enum to flag a function that needs to be
 /// executed following. Also used in state transitions
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CommandToExecute {
     Stop,
     Engage,
@@ -65,7 +64,7 @@ pub enum CommandToExecute {
 //==========================================================
 
 /// adc channels being monitored
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub enum AdcChannel {
     Current,
     Voltage,
@@ -277,8 +276,8 @@ static mut ADC_RESULTS: AdcResults = AdcResults {
 
 //==========================================================
 
-/// the state variables for the firmware
-pub struct Hardware {
+/// the state variables for the hardware
+pub struct State {
     // hardware stuff
     cpu: pypilot_controller_board::pac::CPU,
     exint: pypilot_controller_board::pac::EXINT,
@@ -290,13 +289,11 @@ pub struct Hardware {
     ina_pin: hal::port::portd::PD2<Output>,
     inb_pin: hal::port::portd::PD3<Output>,
     pwm_pin: hal::port::portd::PD6<Pwm<Timer0Pwm>>,
-    #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    serial: RefCell<pypilot_controller_board::Serial<Floating>>,
     // state stuff
     machine_state: (PyPilotStateMachine, PyPilotStateMachine),
     prev_state: (PyPilotStateMachine, PyPilotStateMachine),
     timeout: u16,
-    serial_data_timeout: u16,
+    comm_timeout: u16,
     command_value: u16,
     lastpos: u16,
     max_slew_speed: u8,
@@ -309,37 +306,39 @@ pub struct Hardware {
     rudder_max: u16,
     flags: u16,
     pending_cmd: CommandToExecute,
+    outgoing_state: OutgoingPacketState,
 }
 
 //==========================================================
 
 #[hal::entry]
 fn main() -> ! {
-    let mut hdwr = setup();
+    let mut state = setup();
     loop {
-        hdwr = serial::process_serial(hdwr);
-        hdwr = match hdwr.pending_cmd {
-            CommandToExecute::ProcessPacket(pkt) => packet::process_packet(pkt, hdwr),
-            _ => hdwr,
+        state = serial::process_serial(state);
+        // check if we need to process packet
+        state = match state.pending_cmd {
+            CommandToExecute::ProcessPacket(pkt) => packet::process_packet(pkt, state),
+            _ => state,
         };
-        hdwr = match hdwr.pending_cmd {
-            CommandToExecute::Stop => stop(hdwr),
-            _ => hdwr,
+        // deal with packet induced stop's
+        match state.pending_cmd {
+            CommandToExecute::Stop => stop(&mut state),
+            _ => {}
         };
-        unsafe {
-            if OUT_SYNC_STATE == OutgoingPacketState::Build {
-                hdwr = packet::build_outgoing(hdwr);
-            }
+        // build outgoing packet if asked
+        if state.outgoing_state == OutgoingPacketState::Build {
+            state = packet::build_outgoing(state);
         }
-        hdwr = process_fsm(hdwr);
+        state = process_fsm(state);
     }
 }
 
 //==========================================================
 
 /// finite state machine state's
-#[derive(Copy, Clone, PartialEq)]
-enum PyPilotStateMachine {
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum PyPilotStateMachine {
     Start,
     WaitEntry,
     Wait,
@@ -371,11 +370,11 @@ fn change_state(
     }
 }
 
-#[cfg(debug_assertions)]
-impl PyPilotStateMachine {
+/// convert to u8
+impl From<PyPilotStateMachine> for u8 {
     /// send the state to serial
-    fn send(&self) -> u8 {
-        match self {
+    fn from(original: PyPilotStateMachine) -> u8 {
+        match original {
             PyPilotStateMachine::Start => 0x00,
             PyPilotStateMachine::WaitEntry => 0x01,
             PyPilotStateMachine::Wait => 0x02,
@@ -390,32 +389,10 @@ impl PyPilotStateMachine {
     }
 }
 
-/// send the state transition to serial, new and previous states
-#[cfg(debug_assertions)]
-fn send_tuple(
-    state: (PyPilotStateMachine, PyPilotStateMachine),
-    serial: &mut pypilot_controller_board::Serial<Floating>,
-) {
-    let ty = PacketType::CurrentFSM.into();
-    let pkt: [u8; 3] = [ty, state.0.send(), 0x00];
-    let crc = crc8(pkt);
-    for b in pkt.iter() {
-        serial.write_byte(*b);
-    }
-    serial.write_byte(crc);
-    let ty = PacketType::PreviousFSM.into();
-    let pkt = [ty, state.1.send(), 0x00];
-    let crc = crc8(pkt);
-    for b in pkt.iter() {
-        serial.write_byte(*b);
-    }
-    serial.write_byte(crc);
-}
-
 //==========================================================
 
 /// setup the hardware for the main loop
-fn setup() -> Hardware {
+fn setup() -> State {
     let dp = pypilot_controller_board::Peripherals::take().unwrap();
 
     // turn off unused modules
@@ -473,12 +450,20 @@ fn setup() -> Hardware {
 
     // setup serial
     #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    let serial = pypilot_controller_board::Serial::<Floating>::new(
+    let mut serial = pypilot_controller_board::Serial::<Floating>::new(
         dp.USART0,
         pins.rx,
         pins.tx.into_output(&mut pins.ddr),
         57600.into_baudrate(),
     );
+    // turn on RX interrupt
+    #[cfg(any(debug_assertions, feature = "serial_packets"))]
+    serial.listen(hal::usart::Event::RxComplete);
+    // split into reader and write and send to static variables
+    #[cfg(any(debug_assertions, feature = "serial_packets"))]
+    let (reader, writer) = serial.split();
+    #[cfg(any(debug_assertions, feature = "serial_packets"))]
+    serial::setup_serial(reader, writer);
 
     // setup adc, not using the HAL, because it doesn't do interrupts
     let adc = dp.ADC;
@@ -513,8 +498,7 @@ fn setup() -> Hardware {
         ADC_RESULTS.setup();
         interrupt::enable();
     }
-
-    Hardware {
+    State {
         cpu: cpu,
         exint: dp.EXINT,
         timer0: timer0,
@@ -525,12 +509,10 @@ fn setup() -> Hardware {
         inb_pin: inb_pin,
         pwm_pin: pwm_pin,
         adc: RefCell::new(adc),
-        #[cfg(any(debug_assertions, feature = "serial_packets"))]
-        serial: RefCell::new(serial),
         machine_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
         prev_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
         timeout: 0,
-        serial_data_timeout: 250,
+        comm_timeout: 250,
         command_value: 1000,
         lastpos: 1000,
         max_slew_speed: 15,
@@ -547,30 +529,32 @@ fn setup() -> Hardware {
         rudder_max: 65535,
         flags: 0x00,
         pending_cmd: CommandToExecute::None,
+        outgoing_state: OutgoingPacketState::None,
     }
 }
 
 //==========================================================
 
 /// power down the cpu
-fn power_down_mode(hdwr: Hardware) -> Hardware {
+fn power_down_mode(state: &mut State) {
     // delay for a bit, so that usart can finish any transmission
     #[cfg(any(debug_assertions, feature = "serial_packets"))]
     pypilot_controller_board::delay_ms(10);
 
     // disable modules
     // adc off
-    hdwr.adc
+    state
+        .adc
         .borrow_mut()
         .adcsra
         .write(|w| w.aden().clear_bit().adif().clear_bit());
 
     // release hal serial which turns it off
     #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    let (usart, rxpin, txpin) = hdwr.serial.into_inner().release();
+    //let (usart, rxpin, txpin) = state.serial.into_inner().release();
 
     // turn off clocks
-    hdwr.cpu.prr.modify(|_, w| {
+    state.cpu.prr.modify(|_, w| {
         #[cfg(any(debug_assertions, feature = "serial_packets"))]
         w.prusart0().set_bit();
         w.prspi().set_bit();
@@ -581,28 +565,28 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
 
     // set PCINT2 interrupt
     unsafe {
-        hdwr.exint.pcicr.modify(|r, w| w.bits(r.bits() | 4));
+        state.exint.pcicr.modify(|r, w| w.bits(r.bits() | 4));
         // set RX pin interrupt (PD0 = PCINT16)
-        hdwr.exint.pcmsk2.modify(|r, w| w.bits(r.bits() | 1));
+        state.exint.pcmsk2.modify(|r, w| w.bits(r.bits() | 1));
     }
 
     // do the power down, if PCINT2 interrupt hasn't happened
     // no other interrupts are important, as the Pi will
     // be powered off in this state, so only need
     // to detect receive activity
-    hdwr.cpu.smcr.write(|w| w.sm().pdown());
+    state.cpu.smcr.write(|w| w.sm().pdown());
     interrupt::disable();
     unsafe {
         if !ptr::read_volatile(&PENDINGPCINT2) {
             // set TCNT2 to 0
-            hdwr.timer2.tcnt2.write(|w| w.bits(0));
+            state.timer2.tcnt2.write(|w| w.bits(0));
             // sleep enable
-            hdwr.cpu.smcr.modify(|_, w| w.se().set_bit());
+            state.cpu.smcr.modify(|_, w| w.se().set_bit());
             interrupt::enable();
             // sleep cpu
             avr_device::asm::sleep();
             // sleep disable
-            hdwr.cpu.smcr.modify(|_, w| w.se().clear_bit());
+            state.cpu.smcr.modify(|_, w| w.se().clear_bit());
         } else {
             // PCINT2 pending
             ptr::write_volatile(&mut PENDINGPCINT2, false);
@@ -612,12 +596,12 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
 
     // stop PCINT2 interrupt
     unsafe {
-        hdwr.exint.pcicr.modify(|r, w| w.bits(r.bits() & !4));
-        hdwr.exint.pcmsk2.modify(|r, w| w.bits(r.bits() & !1));
+        state.exint.pcicr.modify(|r, w| w.bits(r.bits() & !4));
+        state.exint.pcmsk2.modify(|r, w| w.bits(r.bits() & !1));
     }
 
     // turn on clocks
-    hdwr.cpu.prr.modify(|_, w| {
+    state.cpu.prr.modify(|_, w| {
         #[cfg(any(debug_assertions, feature = "serial_packets"))]
         w.prusart0().clear_bit();
         w.prspi().clear_bit();
@@ -627,7 +611,7 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
     });
 
     // enable modules
-    hdwr.adc.borrow_mut().adcsra.write(|w| {
+    state.adc.borrow_mut().adcsra.write(|w| {
         w.aden()
             .set_bit()
             .adsc()
@@ -637,58 +621,20 @@ fn power_down_mode(hdwr: Hardware) -> Hardware {
             .adps()
             .prescaler_128()
     });
-    let newserial = pypilot_controller_board::Serial::<Floating>::new(
-        usart,
-        rxpin,
-        txpin,
-        57600.into_baudrate(),
-    );
-
-    // reset serial cell, back to default values also
-    Hardware {
-        cpu: hdwr.cpu,
-        exint: hdwr.exint,
-        timer0: hdwr.timer0,
-        timer2: hdwr.timer2,
-        ena_pin: hdwr.ena_pin,
-        enb_pin: hdwr.enb_pin,
-        ina_pin: hdwr.ina_pin,
-        inb_pin: hdwr.inb_pin,
-        pwm_pin: hdwr.pwm_pin,
-        adc: hdwr.adc,
-        #[cfg(any(debug_assertions, feature = "serial_packets"))]
-        serial: RefCell::new(newserial),
-        machine_state: hdwr.machine_state,
-        prev_state: hdwr.prev_state,
-        timeout: 0,
-        serial_data_timeout: hdwr.serial_data_timeout - 250,
-        command_value: 1000,
-        lastpos: 1000,
-        max_slew_speed: hdwr.max_slew_speed,
-        max_slew_slow: hdwr.max_slew_slow,
-        max_voltage: hdwr.max_voltage,
-        max_current: hdwr.max_current,
-        max_controller_temp: hdwr.max_controller_temp,
-        max_motor_temp: hdwr.max_motor_temp,
-        rudder_min: hdwr.rudder_min,
-        rudder_max: hdwr.rudder_max,
-        flags: hdwr.flags,
-        pending_cmd: CommandToExecute::None,
-    }
 }
 
 //==========================================================
 
 /// stop the motor
-fn stop(mut hdwr: Hardware) -> Hardware {
-    hdwr.command_value = 1000;
-    position(hdwr, 1000)
+fn stop(state: &mut State) {
+    state.command_value = 1000;
+    position(state, 1000)
 }
 
 //==========================================================
 
 /// update the pwm based on motor command
-fn position(mut hdwr: Hardware, value: u16) -> Hardware {
+fn position(state: &mut State, value: u16) {
     // foPWM = fclk/(prescale*256)
     // foPWM = 3.906kHz
     let newpos = if value >= 1000 {
@@ -696,63 +642,64 @@ fn position(mut hdwr: Hardware, value: u16) -> Hardware {
     } else {
         (1000 - value) / 4
     };
-    hdwr.pwm_pin.set_duty(newpos.try_into().unwrap());
+    state.pwm_pin.set_duty(newpos.try_into().unwrap());
     if value > 1040 {
-        hdwr.ina_pin.set_low().unwrap();
-        hdwr.inb_pin.set_high().unwrap();
+        state.ina_pin.set_low().unwrap();
+        state.inb_pin.set_high().unwrap();
     } else if value < 960 {
-        hdwr.ina_pin.set_high().unwrap();
-        hdwr.inb_pin.set_low().unwrap();
+        state.ina_pin.set_high().unwrap();
+        state.inb_pin.set_low().unwrap();
     } else {
         // set brake
-        hdwr.ina_pin.set_low().unwrap();
-        hdwr.inb_pin.set_low().unwrap();
+        state.ina_pin.set_low().unwrap();
+        state.inb_pin.set_low().unwrap();
     }
-    Hardware {
-        cpu: hdwr.cpu,
-        exint: hdwr.exint,
-        timer0: hdwr.timer0,
-        timer2: hdwr.timer2,
-        ena_pin: hdwr.ena_pin,
-        enb_pin: hdwr.enb_pin,
-        ina_pin: hdwr.ina_pin,
-        inb_pin: hdwr.inb_pin,
-        pwm_pin: hdwr.pwm_pin,
-        adc: hdwr.adc,
-        #[cfg(any(debug_assertions, feature = "serial_packets"))]
-        serial: hdwr.serial,
-        machine_state: hdwr.machine_state,
-        prev_state: hdwr.prev_state,
-        timeout: hdwr.timeout,
-        serial_data_timeout: hdwr.serial_data_timeout,
-        command_value: hdwr.command_value,
-        lastpos: value,
-        max_slew_speed: hdwr.max_slew_speed,
-        max_slew_slow: hdwr.max_slew_slow,
-        max_voltage: hdwr.max_voltage,
-        max_current: hdwr.max_current,
-        max_controller_temp: hdwr.max_controller_temp,
-        max_motor_temp: hdwr.max_motor_temp,
-        rudder_min: hdwr.rudder_min,
-        rudder_max: hdwr.rudder_max,
-        flags: hdwr.flags,
-        pending_cmd: hdwr.pending_cmd,
+    /*
+    State {
+        cpu: state.cpu,
+        exint: state.exint,
+        timer0: state.timer0,
+        timer2: state.timer2,
+        ena_pin: state.ena_pin,
+        enb_pin: state.enb_pin,
+        ina_pin: state.ina_pin,
+        inb_pin: state.inb_pin,
+        pwm_pin: state.pwm_pin,
+        adc: state.adc,
+        machine_state: state.machine_state,
+        prev_state: state.prev_state,
+        timeout: state.timeout,
+        comm_timeout: state.comm_timeout,
+        command_value: state.command_value,
+        lastpos: state.lastpos,
+        max_slew_speed: state.max_slew_speed,
+        max_slew_slow: state.max_slew_slow,
+        max_voltage: state.max_voltage,
+        max_current: state.max_current,
+        max_controller_temp: state.max_controller_temp,
+        max_motor_temp: state.max_motor_temp,
+        rudder_min: state.rudder_min,
+        rudder_max: state.rudder_max,
+        flags: state.flags,
+        pending_cmd: state.pending_cmd,
+        outgoing_state: state.outgoing_state,
     }
+    */
 }
 
 //==========================================================
 
 /// the main state machine processer
-fn process_fsm(mut hdwr: Hardware) -> Hardware {
+fn process_fsm(mut state: State) -> State {
     // first check the times, set do_update boolean
     // if motor position should be updated
     let do_update = interrupt::free(|_cs| {
-        let ticks = hdwr.timer2.tcnt2.read().bits();
+        let ticks = state.timer2.tcnt2.read().bits();
         if ticks > 78 {
-            hdwr.timeout += 1;
-            hdwr.serial_data_timeout += 1;
+            state.timeout += 1;
+            state.comm_timeout += 1;
             unsafe {
-                hdwr.timer2.tcnt2.modify(|r, w| w.bits(r.bits() - 78));
+                state.timer2.tcnt2.modify(|r, w| w.bits(r.bits() - 78));
             }
             true
         } else {
@@ -761,44 +708,44 @@ fn process_fsm(mut hdwr: Hardware) -> Hardware {
     });
 
     // FSM
-    let newstate = match hdwr.machine_state.0 {
+    let newstate = match state.machine_state.0 {
         PyPilotStateMachine::Start => {
-            change_state(PyPilotStateMachine::WaitEntry, hdwr.machine_state)
+            change_state(PyPilotStateMachine::WaitEntry, state.machine_state)
         }
         PyPilotStateMachine::WaitEntry => {
-            hdwr.timeout = 0;
-            hdwr.ina_pin.set_low().void_unwrap();
-            hdwr.inb_pin.set_low().void_unwrap();
-            change_state(PyPilotStateMachine::Wait, hdwr.machine_state)
+            state.timeout = 0;
+            state.ina_pin.set_low().void_unwrap();
+            state.inb_pin.set_low().void_unwrap();
+            change_state(PyPilotStateMachine::Wait, state.machine_state)
         }
         PyPilotStateMachine::Wait => {
-            if hdwr.timeout > 30 || hdwr.pending_cmd == CommandToExecute::Disengage {
-                change_state(PyPilotStateMachine::DisengageEntry, hdwr.machine_state)
-            } else if hdwr.pending_cmd == CommandToExecute::Engage {
-                change_state(PyPilotStateMachine::Engage, hdwr.machine_state)
+            if state.timeout > 30 || state.pending_cmd == CommandToExecute::Disengage {
+                change_state(PyPilotStateMachine::DisengageEntry, state.machine_state)
+            } else if state.pending_cmd == CommandToExecute::Engage {
+                change_state(PyPilotStateMachine::Engage, state.machine_state)
             } else {
-                hdwr.machine_state
+                state.machine_state
             }
         }
         PyPilotStateMachine::Engage => {
-            hdwr.timeout = 0;
-            hdwr.flags |= ENGAGED;
+            state.timeout = 0;
+            state.flags |= ENGAGED;
             // start PWM
-            hdwr.ina_pin.set_low().void_unwrap();
-            hdwr.ina_pin.set_low().void_unwrap();
-            hdwr.pwm_pin.set_duty(0);
-            hdwr.pwm_pin.enable();
-            hdwr = position(hdwr, 1000);
-            change_state(PyPilotStateMachine::Operational, hdwr.machine_state)
+            state.ina_pin.set_low().void_unwrap();
+            state.ina_pin.set_low().void_unwrap();
+            state.pwm_pin.set_duty(0);
+            state.pwm_pin.enable();
+            position(&mut state, 1000);
+            change_state(PyPilotStateMachine::Operational, state.machine_state)
         }
         PyPilotStateMachine::Operational => {
             if do_update {
-                let speed_rate: i16 = hdwr.max_slew_speed.into();
+                let speed_rate: i16 = state.max_slew_speed.into();
                 // value of 20 is 1 second full range at 50hz
-                let slow_rate: i16 = hdwr.max_slew_slow.into();
-                let cur_value: u16 = hdwr.lastpos;
+                let slow_rate: i16 = state.max_slew_slow.into();
+                let cur_value: u16 = state.lastpos;
                 // this should always be in range
-                let mut diff: i16 = (hdwr.command_value - cur_value).try_into().unwrap();
+                let mut diff: i16 = (state.command_value - cur_value).try_into().unwrap();
 
                 // limit motor speed change to within speed and slow slew rates
                 if diff > 0 {
@@ -836,92 +783,96 @@ fn process_fsm(mut hdwr: Hardware) -> Hardware {
                         new_pos += diff as u16;
                     }
                 }
-                hdwr = position(hdwr, new_pos);
+                position(&mut state, new_pos);
             }
 
-            if hdwr.timeout > 30 || hdwr.pending_cmd == CommandToExecute::Disengage {
-                change_state(PyPilotStateMachine::DisengageEntry, hdwr.machine_state)
+            if state.timeout > 30 || state.pending_cmd == CommandToExecute::Disengage {
+                change_state(PyPilotStateMachine::DisengageEntry, state.machine_state)
             } else {
-                hdwr.machine_state
+                state.machine_state
             }
         }
         PyPilotStateMachine::DisengageEntry => {
-            hdwr = stop(hdwr);
-            hdwr.flags &= !ENGAGED;
-            if hdwr.pending_cmd == CommandToExecute::Engage {
-                change_state(PyPilotStateMachine::Engage, hdwr.machine_state)
+            stop(&mut state);
+            state.flags &= !ENGAGED;
+            if state.pending_cmd == CommandToExecute::Engage {
+                change_state(PyPilotStateMachine::Engage, state.machine_state)
             } else {
-                change_state(PyPilotStateMachine::Disengage, hdwr.machine_state)
+                change_state(PyPilotStateMachine::Disengage, state.machine_state)
             }
         }
         PyPilotStateMachine::Disengage => {
-            if hdwr.timeout > 62 {
-                change_state(PyPilotStateMachine::DetachEntry, hdwr.machine_state)
-            } else if hdwr.pending_cmd == CommandToExecute::Engage {
-                change_state(PyPilotStateMachine::Engage, hdwr.machine_state)
+            if state.timeout > 62 {
+                change_state(PyPilotStateMachine::DetachEntry, state.machine_state)
+            } else if state.pending_cmd == CommandToExecute::Engage {
+                change_state(PyPilotStateMachine::Engage, state.machine_state)
             } else {
-                hdwr.machine_state
+                state.machine_state
             }
         }
         PyPilotStateMachine::DetachEntry => {
-            hdwr.ina_pin.set_low().void_unwrap();
-            hdwr.inb_pin.set_low().void_unwrap();
-            hdwr.pwm_pin.set_duty(0);
-            hdwr.pwm_pin.disable();
-            change_state(PyPilotStateMachine::Detach, hdwr.machine_state)
+            state.ina_pin.set_low().void_unwrap();
+            state.inb_pin.set_low().void_unwrap();
+            state.pwm_pin.set_duty(0);
+            state.pwm_pin.disable();
+            change_state(PyPilotStateMachine::Detach, state.machine_state)
         }
         PyPilotStateMachine::Detach => {
-            if hdwr.timeout > 62 && hdwr.serial_data_timeout > 250 {
-                change_state(PyPilotStateMachine::PowerDown, hdwr.machine_state)
-            } else if hdwr.pending_cmd == CommandToExecute::Engage {
-                change_state(PyPilotStateMachine::Engage, hdwr.machine_state)
+            if state.timeout > 62 && state.comm_timeout > 250 {
+                change_state(PyPilotStateMachine::PowerDown, state.machine_state)
+            } else if state.pending_cmd == CommandToExecute::Engage {
+                change_state(PyPilotStateMachine::Engage, state.machine_state)
             } else {
-                hdwr.machine_state
+                state.machine_state
             }
         }
         PyPilotStateMachine::PowerDown => {
-            #[cfg(any(debug_assertions, feature = "serial_packets"))]
-            hdwr.serial.borrow_mut().flush();
+            //#[cfg(any(debug_assertions, feature = "serial_packets"))]
+            //nb::block!(state.serial.flush()).void_unwrap();
             // cpu goes to sleep, then woken up
-            hdwr = power_down_mode(hdwr);
-            change_state(PyPilotStateMachine::WaitEntry, hdwr.machine_state)
+            power_down_mode(&mut state);
+            state.timeout = 0;
+            state.comm_timeout = state.comm_timeout - 250;
+            state.command_value = 1000;
+            state.lastpos = 1000;
+            state.pending_cmd = CommandToExecute::None;
+            change_state(PyPilotStateMachine::WaitEntry, state.machine_state)
         }
     };
     // check and see if machine state has changed, if so, send it via serial port
-    if hdwr.prev_state.0 != hdwr.machine_state.0 || hdwr.prev_state.1 != hdwr.machine_state.1 {
-        /*        #[cfg(debug_assertions)]
-        send_tuple(hdwr.machine_state, &mut hdwr.serial.borrow_mut());*/
-        hdwr.prev_state = hdwr.machine_state;
+    if state.prev_state.0 != state.machine_state.0 || state.prev_state.1 != state.machine_state.1 {
+        //#[cfg(any(debug_assertions, feature = "serial_packets"))]
+        //serial::send_tuple(&mut state);
+        state.prev_state = state.machine_state;
     }
-    Hardware {
-        cpu: hdwr.cpu,
-        exint: hdwr.exint,
-        timer0: hdwr.timer0,
-        timer2: hdwr.timer2,
-        ena_pin: hdwr.ena_pin,
-        enb_pin: hdwr.enb_pin,
-        ina_pin: hdwr.ina_pin,
-        inb_pin: hdwr.inb_pin,
-        pwm_pin: hdwr.pwm_pin,
-        adc: hdwr.adc,
-        #[cfg(any(debug_assertions, feature = "serial_packets"))]
-        serial: hdwr.serial,
+    State {
+        cpu: state.cpu,
+        exint: state.exint,
+        timer0: state.timer0,
+        timer2: state.timer2,
+        ena_pin: state.ena_pin,
+        enb_pin: state.enb_pin,
+        ina_pin: state.ina_pin,
+        inb_pin: state.inb_pin,
+        pwm_pin: state.pwm_pin,
+        adc: state.adc,
         machine_state: newstate,
-        prev_state: hdwr.prev_state,
-        timeout: hdwr.timeout,
-        serial_data_timeout: hdwr.serial_data_timeout,
-        command_value: hdwr.command_value,
-        lastpos: hdwr.lastpos,
-        max_slew_speed: hdwr.max_slew_speed,
-        max_slew_slow: hdwr.max_slew_slow,
-        max_voltage: hdwr.max_voltage,
-        max_current: hdwr.max_current,
-        max_controller_temp: hdwr.max_controller_temp,
-        max_motor_temp: hdwr.max_motor_temp,
-        rudder_min: hdwr.rudder_min,
-        rudder_max: hdwr.rudder_max,
-        flags: hdwr.flags,
+        prev_state: state.prev_state,
+        timeout: state.timeout,
+        comm_timeout: state.comm_timeout,
+        command_value: state.command_value,
+        lastpos: state.lastpos,
+        max_slew_speed: state.max_slew_speed,
+        max_slew_slow: state.max_slew_slow,
+        max_voltage: state.max_voltage,
+        max_current: state.max_current,
+        max_controller_temp: state.max_controller_temp,
+        max_motor_temp: state.max_motor_temp,
+        rudder_min: state.rudder_min,
+        rudder_max: state.rudder_max,
+        flags: state.flags,
         pending_cmd: CommandToExecute::None,
+        outgoing_state: state.outgoing_state,
     }
 }
 

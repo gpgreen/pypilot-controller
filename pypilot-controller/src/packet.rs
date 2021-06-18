@@ -1,7 +1,6 @@
 use crate::{
-    AdcChannel, CommandToExecute, Hardware, ADC_RESULTS, BADVOLTAGEFAULT, LOWCURRENT,
-    MAXRUDDERFAULT, MINRUDDERFAULT, OVERCURRENTFAULT, OVERTEMPFAULT, PORTPINFAULT, REBOOTED,
-    STBDPINFAULT, SYNC,
+    AdcChannel, CommandToExecute, State, ADC_RESULTS, BADVOLTAGEFAULT, LOWCURRENT, MAXRUDDERFAULT,
+    MINRUDDERFAULT, OVERCURRENTFAULT, OVERTEMPFAULT, PORTPINFAULT, REBOOTED, STBDPINFAULT, SYNC,
 };
 use avr_device::interrupt;
 use core::convert::TryFrom;
@@ -177,24 +176,24 @@ fn build_rudder_pkt() -> (bool, u16, PacketType) {
 //==========================================================
 
 /// handle a received packet
-pub fn process_packet(pkt: [u8; 3], mut hdwr: Hardware) -> Hardware {
-    hdwr.flags |= SYNC;
+pub fn process_packet(pkt: [u8; 3], mut state: State) -> State {
+    state.flags |= SYNC;
     let mut val: u16 = pkt[1] as u16 | ((pkt[2] as u16) << 8);
     match PacketType::try_from(pkt[0]) {
         Ok(ty) => match ty {
             PacketType::CommandCode => {
-                hdwr.timeout = 0;
+                state.timeout = 0;
                 // check for valid range and none of these faults
                 if val <= 2000
-                    && (hdwr.flags & (OVERTEMPFAULT | OVERCURRENTFAULT | BADVOLTAGEFAULT)) == 0
+                    && (state.flags & (OVERTEMPFAULT | OVERCURRENTFAULT | BADVOLTAGEFAULT)) == 0
                 {
-                    if (hdwr.flags & (PORTPINFAULT | MAXRUDDERFAULT)) != 0
-                        || ((hdwr.flags & (STBDPINFAULT | MINRUDDERFAULT)) != 0 && val < 1000)
+                    if (state.flags & (PORTPINFAULT | MAXRUDDERFAULT)) != 0
+                        || ((state.flags & (STBDPINFAULT | MINRUDDERFAULT)) != 0 && val < 1000)
                     {
-                        hdwr.pending_cmd = CommandToExecute::Stop;
+                        state.pending_cmd = CommandToExecute::Stop;
                     } else {
-                        hdwr.command_value = val;
-                        hdwr.pending_cmd = CommandToExecute::Engage;
+                        state.command_value = val;
+                        state.pending_cmd = CommandToExecute::Engage;
                     }
                 }
             }
@@ -203,79 +202,78 @@ pub fn process_packet(pkt: [u8; 3], mut hdwr: Hardware) -> Hardware {
                 if val > max_max_current {
                     val = max_max_current;
                 }
-                hdwr.max_current = val;
+                state.max_current = val;
             }
             PacketType::MaxControllerTempCode => {
                 if val > 10000 {
                     val = 10000;
                 }
-                hdwr.max_controller_temp = val;
+                state.max_controller_temp = val;
             }
             PacketType::MaxMotorTempCode => {
                 if val > 10000 {
                     val = 10000;
                 }
-                hdwr.max_motor_temp = val;
+                state.max_motor_temp = val;
             }
-            PacketType::RudderMinCode => hdwr.rudder_min = val,
-            PacketType::RudderMaxCode => hdwr.rudder_max = val,
-            PacketType::DisengageCode => hdwr.pending_cmd = CommandToExecute::Disengage,
+            PacketType::RudderMinCode => state.rudder_min = val,
+            PacketType::RudderMaxCode => state.rudder_max = val,
+            PacketType::DisengageCode => state.pending_cmd = CommandToExecute::Disengage,
             PacketType::MaxSlewCode => {
-                hdwr.max_slew_speed = pkt[1];
-                hdwr.max_slew_slow = pkt[2];
+                state.max_slew_speed = pkt[1];
+                state.max_slew_slow = pkt[2];
                 // if set at the end of the rage (up to 255) no slew limit
-                if hdwr.max_slew_speed > 250 {
-                    hdwr.max_slew_speed = 250;
+                if state.max_slew_speed > 250 {
+                    state.max_slew_speed = 250;
                 }
-                if hdwr.max_slew_slow > 250 {
-                    hdwr.max_slew_slow = 250;
+                if state.max_slew_slow > 250 {
+                    state.max_slew_slow = 250;
                 }
                 // must have some slew
-                if hdwr.max_slew_speed == 0 {
-                    hdwr.max_slew_speed = 1;
+                if state.max_slew_speed == 0 {
+                    state.max_slew_speed = 1;
                 }
-                if hdwr.max_slew_slow == 0 {
-                    hdwr.max_slew_slow = 1;
+                if state.max_slew_slow == 0 {
+                    state.max_slew_slow = 1;
                 }
             }
             PacketType::EEPROMReadCode => {}
             PacketType::EEPROMWriteCode => {}
             PacketType::ReprogramCode => {}
-            PacketType::ResetCode => hdwr.flags &= !OVERCURRENTFAULT,
+            PacketType::ResetCode => state.flags &= !OVERCURRENTFAULT,
             PacketType::RudderRangeCode => {}
             _ => {}
         },
         Err(_) => {}
     }
-    Hardware {
-        cpu: hdwr.cpu,
-        exint: hdwr.exint,
-        timer0: hdwr.timer0,
-        timer2: hdwr.timer2,
-        ena_pin: hdwr.ena_pin,
-        enb_pin: hdwr.enb_pin,
-        ina_pin: hdwr.ina_pin,
-        inb_pin: hdwr.inb_pin,
-        pwm_pin: hdwr.pwm_pin,
-        adc: hdwr.adc,
-        #[cfg(any(debug_assertions, feature = "serial_packets"))]
-        serial: hdwr.serial,
-        machine_state: hdwr.machine_state,
-        prev_state: hdwr.prev_state,
-        timeout: hdwr.timeout,
-        serial_data_timeout: hdwr.serial_data_timeout,
-        command_value: hdwr.command_value,
-        lastpos: hdwr.lastpos,
-        max_slew_speed: hdwr.max_slew_speed,
-        max_slew_slow: hdwr.max_slew_slow,
-        max_voltage: hdwr.max_voltage,
-        max_current: hdwr.max_current,
-        max_controller_temp: hdwr.max_controller_temp,
-        max_motor_temp: hdwr.max_motor_temp,
-        rudder_min: hdwr.rudder_min,
-        rudder_max: hdwr.rudder_max,
-        flags: hdwr.flags,
-        pending_cmd: hdwr.pending_cmd,
+    State {
+        cpu: state.cpu,
+        exint: state.exint,
+        timer0: state.timer0,
+        timer2: state.timer2,
+        ena_pin: state.ena_pin,
+        enb_pin: state.enb_pin,
+        ina_pin: state.ina_pin,
+        inb_pin: state.inb_pin,
+        pwm_pin: state.pwm_pin,
+        adc: state.adc,
+        machine_state: state.machine_state,
+        prev_state: state.prev_state,
+        timeout: state.timeout,
+        comm_timeout: state.comm_timeout,
+        command_value: state.command_value,
+        lastpos: state.lastpos,
+        max_slew_speed: state.max_slew_speed,
+        max_slew_slow: state.max_slew_slow,
+        max_voltage: state.max_voltage,
+        max_current: state.max_current,
+        max_controller_temp: state.max_controller_temp,
+        max_motor_temp: state.max_motor_temp,
+        rudder_min: state.rudder_min,
+        rudder_max: state.rudder_max,
+        flags: state.flags,
+        pending_cmd: state.pending_cmd,
+        outgoing_state: state.outgoing_state,
     }
 }
 
@@ -284,7 +282,7 @@ pub fn process_packet(pkt: [u8; 3], mut hdwr: Hardware) -> Hardware {
 /// buffer to hold outgoing packet
 pub static mut OUT_BYTES: [u8; 3] = [0; 3];
 
-#[derive(PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum OutgoingPacketState {
     None,
     Build,
@@ -300,7 +298,7 @@ pub enum OutgoingPacketState {
 pub static mut OUT_SYNC_STATE: OutgoingPacketState = OutgoingPacketState::None;
 
 /// build a new packet to send
-pub fn build_outgoing(mut hdwr: Hardware) -> Hardware {
+pub fn build_outgoing(mut state: State) -> State {
     // which position in the cycle
     static mut OUT_SYNC_POS: u8 = 0;
 
@@ -310,8 +308,8 @@ pub fn build_outgoing(mut hdwr: Hardware) -> Hardware {
     unsafe {
         let (use_it, v, code) = match OUT_SYNC_POS {
             0 | 10 | 20 | 30 => {
-                hdwr.flags &= !REBOOTED;
-                (true, hdwr.flags, PacketType::FlagsCode)
+                state.flags &= !REBOOTED;
+                (true, state.flags, PacketType::FlagsCode)
             }
             1 | 4 | 7 | 11 | 14 | 17 | 21 | 24 | 27 | 31 | 34 | 37 | 40 => interrupt::free(|_cs| {
                 if ADC_RESULTS.count(AdcChannel::Current, 0) < 50 {
@@ -350,34 +348,33 @@ pub fn build_outgoing(mut hdwr: Hardware) -> Hardware {
             OUT_SYNC_POS = 0;
         }
     }
-    Hardware {
-        cpu: hdwr.cpu,
-        exint: hdwr.exint,
-        timer0: hdwr.timer0,
-        timer2: hdwr.timer2,
-        ena_pin: hdwr.ena_pin,
-        enb_pin: hdwr.enb_pin,
-        ina_pin: hdwr.ina_pin,
-        inb_pin: hdwr.inb_pin,
-        pwm_pin: hdwr.pwm_pin,
-        adc: hdwr.adc,
-        #[cfg(any(debug_assertions, feature = "serial_packets"))]
-        serial: hdwr.serial,
-        machine_state: hdwr.machine_state,
-        prev_state: hdwr.prev_state,
-        timeout: hdwr.timeout,
-        serial_data_timeout: hdwr.serial_data_timeout,
-        command_value: hdwr.command_value,
-        lastpos: hdwr.lastpos,
-        max_slew_speed: hdwr.max_slew_speed,
-        max_slew_slow: hdwr.max_slew_slow,
-        max_voltage: hdwr.max_voltage,
-        max_current: hdwr.max_current,
-        max_controller_temp: hdwr.max_controller_temp,
-        max_motor_temp: hdwr.max_motor_temp,
-        rudder_min: hdwr.rudder_min,
-        rudder_max: hdwr.rudder_max,
-        flags: hdwr.flags,
-        pending_cmd: hdwr.pending_cmd,
+    State {
+        cpu: state.cpu,
+        exint: state.exint,
+        timer0: state.timer0,
+        timer2: state.timer2,
+        ena_pin: state.ena_pin,
+        enb_pin: state.enb_pin,
+        ina_pin: state.ina_pin,
+        inb_pin: state.inb_pin,
+        pwm_pin: state.pwm_pin,
+        adc: state.adc,
+        machine_state: state.machine_state,
+        prev_state: state.prev_state,
+        timeout: state.timeout,
+        comm_timeout: state.comm_timeout,
+        command_value: state.command_value,
+        lastpos: state.lastpos,
+        max_slew_speed: state.max_slew_speed,
+        max_slew_slow: state.max_slew_slow,
+        max_voltage: state.max_voltage,
+        max_current: state.max_current,
+        max_controller_temp: state.max_controller_temp,
+        max_motor_temp: state.max_motor_temp,
+        rudder_min: state.rudder_min,
+        rudder_max: state.rudder_max,
+        flags: state.flags,
+        pending_cmd: state.pending_cmd,
+        outgoing_state: state.outgoing_state,
     }
 }
