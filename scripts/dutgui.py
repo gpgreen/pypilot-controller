@@ -58,7 +58,34 @@ def handle_recvd_pkt(pkt):
     elif pkt[0] == 0xa7:
         s += "\nRudder Angle: {}".format(val)
     elif pkt[0] == 0x8f:
-        s += "\nFlags: {:x}".format(val)
+        flags = []
+        if val & 0x1:
+            flags.append("SYNC")
+        if val & 0x2:
+            flags.append("TEMPFAULT")
+        if val & 0x4:
+            flags.append("CURFAULT")
+        if val & 0x8:
+            flags.append("ENGAGED")
+        if val & 0x10:
+            flags.append("INVALID")
+        if val & 0x20:
+            flags.append("PORTFAULT")
+        if val & 0x40:
+            flags.append("STBDFAULT")
+        if val & 0x80:
+            flags.append("BV")
+        if val & 0x100:
+            flags.append("R-")
+        if val & 0x200:
+            flags.append("R+")
+        if val & 0x400:
+            flags.append("CURRNG")
+        if val & 0x800:
+            flags.append("BADFUSE")
+        if val & 0x1000:
+            flags.append("REBOOT")
+        s += "\nFlags: {}".format(" ".join(flags))
     elif pkt[0] == 0x9a:
         s += "\nEEPROMValue: {}".format(val)
     write_to_serial_widget(s + '\n')
@@ -105,20 +132,20 @@ def poll_serial():
     global msg
     read_byte = serial_port.read()
     if len(read_byte) != 0:
-        print("ch:{}".format(read_byte.hex()))
         msg = msg + read_byte
-        if len(msg) == 4:
+        #print("buf:{}".format(msg.hex()))
+        if len(msg) >= 4:
             pkt = msg[:3]
             crc = calc_crc8(pkt)
             if crc[0] == msg[3]:
                 handle_recvd_pkt(pkt)
-                msg = b''
+                msg = msg[4:]
             else:
                 print("bad crc:{}".format(pkt.hex()))
                 msg = msg[1:]
     if engaged:
         update_position(position_scale.get())
-    root.after(20, poll_serial)
+    root.after(200, poll_serial)
     
 def update_position(val):
     pos = int(round(float(val) * 10))

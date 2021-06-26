@@ -13,3 +13,6 @@ debug/
 *.hex
 *.lss
 *.sym
+
+# python compiled files
+*.pyc

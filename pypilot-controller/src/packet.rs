@@ -1,8 +1,4 @@
-use crate::{
-    AdcChannel, CommandToExecute, State, ADC_RESULTS, BADVOLTAGEFAULT, LOWCURRENT, MAXRUDDERFAULT,
-    MINRUDDERFAULT, OVERCURRENTFAULT, OVERTEMPFAULT, PORTPINFAULT, REBOOTED, STBDPINFAULT, SYNC,
-};
-use avr_device::interrupt;
+use crate::{adc::AdcChannel, CommandToExecute, Flags, State, ADC_RESULTS, LOWCURRENT};
 use core::convert::TryFrom;
 
 //==========================================================
@@ -113,71 +109,96 @@ impl TryFrom<u8> for PacketType {
 
 //==========================================================
 
-#[cfg(feature = "motor_temp")]
-fn build_motor_temp_pkt() -> (bool, u16, PacketType) {
-    interrupt::free(|_cs| {
-        if ADC_RESULTS.count(AdcChannel::MotorTemp, 0) > 0 {
-            (
-                true,
-                ADC_RESULTS.take_motor_temp(0),
-                PacketType::MotorTempCode,
-            )
+fn build_current_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
+    unsafe {
+        if ADC_RESULTS.count(AdcChannel::Current, 0) < 50 {
+            false
         } else {
-            (false, 0, PacketType::InvalidCode)
+            *pkt_type = PacketType::CurrentCode;
+            *value = ADC_RESULTS.take_amps(0);
+            true
         }
-    })
+    }
+}
+
+//==========================================================
+
+fn build_voltage_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
+    unsafe {
+        if ADC_RESULTS.count(AdcChannel::Voltage, 0) < 2 {
+            false
+        } else {
+            *pkt_type = PacketType::VoltageCode;
+            *value = ADC_RESULTS.take_volts(0);
+            true
+        }
+    }
+}
+
+//==========================================================
+
+#[cfg(feature = "motor_temp")]
+fn build_motor_temp_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
+    unsafe {
+        if ADC_RESULTS.count(AdcChannel::MotorTemp, 0) > 0 {
+            *pkt_type = PacketType::MotorTempCode;
+            *value = ADC_RESULTS.take_motor_temp(0);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(not(feature = "motor_temp"))]
-fn build_motor_temp_pkt() -> (bool, u16, PacketType) {
-    (false, 0, PacketType::InvalidCode)
+fn build_motor_temp_pkt(_value: &mut u16, _pkt_type: &mut PacketType) -> bool {
+    false
 }
 
 //==========================================================
 
 #[cfg(feature = "controller_temp")]
-fn build_controller_temp_pkt() -> (bool, u16, PacketType) {
-    interrupt::free(|_cs| {
+fn build_controller_temp_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
+    unsafe {
         if ADC_RESULTS.count(AdcChannel::ControllerTemp, 0) > 0 {
-            (
-                true,
-                ADC_RESULTS.take_controller_temp(0),
-                PacketType::ControllerTempCode,
-            )
+            *pkt_type = PacketType::ControllerTempCode;
+            *value = ADC_RESULTS.take_controller_temp(0);
+            true
         } else {
-            (false, 0, PacketType::InvalidCode)
+            false
         }
-    })
+    }
 }
 
 #[cfg(not(feature = "controller_temp"))]
-fn build_controller_temp_pkt() -> (bool, u16, PacketType) {
-    (false, 0, PacketType::InvalidCode)
+fn build_controller_temp_pkt(_value: &mut u16, _pkt_type: &mut PacketType) -> bool {
+    false
 }
 
 //==========================================================
 
 #[cfg(feature = "rudder_angle")]
-fn build_rudder_pkt() -> (bool, u16, PacketType) {
-    interrupt::free(|_cs| {
+fn build_rudder_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
+    unsafe {
         if ADC_RESULTS.count(AdcChannel::Rudder, 0) < 10 {
-            (false, 0, PacketType::InvalidCode)
+            false
         } else {
-            (true, ADC_RESULTS.take_rudder(0), RUDDER_SENSE_CODE)
+            *pkt_type = PacketType::Rudder;
+            *value = ADC_RESULTS.take_rudder(0);
+            true
         }
-    })
+    }
 }
 
 #[cfg(not(feature = "rudder_angle"))]
-fn build_rudder_pkt() -> (bool, u16, PacketType) {
-    (false, 0, PacketType::InvalidCode)
+fn build_rudder_pkt(_value: &mut u16, _pkt_type: &mut PacketType) -> bool {
+    false
 }
 
 //==========================================================
 
 /// handle a received packet
-pub fn process_packet(pkt: [u8; 3], mut state: State) -> State {
-    state.flags |= SYNC;
+pub fn process_packet(pkt: [u8; 3], state: &mut State) {
     let mut val: u16 = pkt[1] as u16 | ((pkt[2] as u16) << 8);
     match PacketType::try_from(pkt[0]) {
         Ok(ty) => match ty {
@@ -185,10 +206,17 @@ pub fn process_packet(pkt: [u8; 3], mut state: State) -> State {
                 state.timeout = 0;
                 // check for valid range and none of these faults
                 if val <= 2000
-                    && (state.flags & (OVERTEMPFAULT | OVERCURRENTFAULT | BADVOLTAGEFAULT)) == 0
+                    && state.flags.contains(
+                        Flags::OVERTEMPFAULT | Flags::OVERCURRENTFAULT | Flags::BADVOLTAGEFAULT,
+                    )
                 {
-                    if (state.flags & (PORTPINFAULT | MAXRUDDERFAULT)) != 0
-                        || ((state.flags & (STBDPINFAULT | MINRUDDERFAULT)) != 0 && val < 1000)
+                    if state
+                        .flags
+                        .contains(Flags::PORTPINFAULT | Flags::MAXRUDDERFAULT)
+                        || (state
+                            .flags
+                            .contains(Flags::STBDPINFAULT | Flags::MINRUDDERFAULT)
+                            && val < 1000)
                     {
                         state.pending_cmd = CommandToExecute::Stop;
                     } else {
@@ -240,141 +268,75 @@ pub fn process_packet(pkt: [u8; 3], mut state: State) -> State {
             PacketType::EEPROMReadCode => {}
             PacketType::EEPROMWriteCode => {}
             PacketType::ReprogramCode => {}
-            PacketType::ResetCode => state.flags &= !OVERCURRENTFAULT,
+            PacketType::ResetCode => state.flags.remove(Flags::OVERCURRENTFAULT),
             PacketType::RudderRangeCode => {}
             _ => {}
         },
         Err(_) => {}
     }
-    State {
-        cpu: state.cpu,
-        exint: state.exint,
-        timer0: state.timer0,
-        timer2: state.timer2,
-        ena_pin: state.ena_pin,
-        enb_pin: state.enb_pin,
-        ina_pin: state.ina_pin,
-        inb_pin: state.inb_pin,
-        pwm_pin: state.pwm_pin,
-        adc: state.adc,
-        machine_state: state.machine_state,
-        prev_state: state.prev_state,
-        timeout: state.timeout,
-        comm_timeout: state.comm_timeout,
-        command_value: state.command_value,
-        lastpos: state.lastpos,
-        max_slew_speed: state.max_slew_speed,
-        max_slew_slow: state.max_slew_slow,
-        max_voltage: state.max_voltage,
-        max_current: state.max_current,
-        max_controller_temp: state.max_controller_temp,
-        max_motor_temp: state.max_motor_temp,
-        rudder_min: state.rudder_min,
-        rudder_max: state.rudder_max,
-        flags: state.flags,
-        pending_cmd: state.pending_cmd,
-        outgoing_state: state.outgoing_state,
-    }
 }
 
 //==========================================================
-
-/// buffer to hold outgoing packet
-pub static mut OUT_BYTES: [u8; 3] = [0; 3];
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum OutgoingPacketState {
     None,
     Build,
-    Start,
-    Byte0,
-    Byte1,
-    Byte2,
-    #[cfg(not(feature = "serial_packets"))]
-    Sent,
+    Send([u8; 3]),
 }
 
-/// position of outgoing packet already sent
-pub static mut OUT_SYNC_STATE: OutgoingPacketState = OutgoingPacketState::None;
-
 /// build a new packet to send
-pub fn build_outgoing(mut state: State) -> State {
+pub fn build_outgoing(state: &State) -> OutgoingPacketState {
     // which position in the cycle
     static mut OUT_SYNC_POS: u8 = 0;
 
     // build outgoing packet and post for sending if required
-    // unsafe is ok, because OUT_SYNC_POS and OUT_BYTES only used outside of interrupts
-    // ADC_RESULTS is used in isr, so it needs wrapped in interrupt::free context
+    // unsafe is ok, because OUT_SYNC_POS only used here
+    let current_pos: u8;
     unsafe {
-        let (use_it, v, code) = match OUT_SYNC_POS {
-            0 | 10 | 20 | 30 => {
-                state.flags &= !REBOOTED;
-                (true, state.flags, PacketType::FlagsCode)
-            }
-            1 | 4 | 7 | 11 | 14 | 17 | 21 | 24 | 27 | 31 | 34 | 37 | 40 => interrupt::free(|_cs| {
-                if ADC_RESULTS.count(AdcChannel::Current, 0) < 50 {
-                    (false, 0, PacketType::InvalidCode)
-                } else {
-                    (true, ADC_RESULTS.take_amps(0), PacketType::CurrentCode)
-                }
-            }),
-            3 | 13 | 23 | 33 => interrupt::free(|_cs| {
-                if ADC_RESULTS.count(AdcChannel::Voltage, 0) < 2 {
-                    (false, 0, PacketType::InvalidCode)
-                } else {
-                    (true, ADC_RESULTS.take_volts(0), PacketType::VoltageCode)
-                }
-            }),
-            2 | 5 | 8 | 12 | 15 | 18 | 22 | 25 | 28 | 32 | 35 | 38 | 41 => build_rudder_pkt(),
-            6 => build_controller_temp_pkt(),
-            9 => build_motor_temp_pkt(),
-            16 | 26 | 36 => {
-                // eeprom reads
-                (false, 0, PacketType::InvalidCode)
-            }
-            // catch all the undefined ranges
-            _ => (false, 0, PacketType::InvalidCode),
-        };
-        // check if outgoing packet is ready
-        if use_it {
-            OUT_BYTES[0] = code.into();
-            OUT_BYTES[1] = (v & 0xFF) as u8;
-            OUT_BYTES[2] = ((v & 0xFF00) >> 8) as u8;
-            OUT_SYNC_STATE = OutgoingPacketState::Start;
+        current_pos = OUT_SYNC_POS;
+    }
+    let mut value: u16 = 0;
+    let mut pkt_type = PacketType::InvalidCode;
+
+    let use_it = match current_pos {
+        0 | 10 | 20 | 30 => {
+            //state.flags &= !REBOOTED;
+            value = state.flags.into();
+            pkt_type = PacketType::FlagsCode;
+            true
         }
-        if OUT_SYNC_POS < 41 {
-            OUT_SYNC_POS += 1;
-        } else {
+        1 | 4 | 7 | 11 | 14 | 17 | 21 | 24 | 27 | 31 | 34 | 37 | 40 => {
+            build_current_pkt(&mut value, &mut pkt_type)
+        }
+        3 | 13 | 23 | 33 => build_voltage_pkt(&mut value, &mut pkt_type),
+        2 | 5 | 8 | 12 | 15 | 18 | 22 | 25 | 28 | 32 | 35 | 38 | 41 => {
+            build_rudder_pkt(&mut value, &mut pkt_type)
+        }
+        6 => build_controller_temp_pkt(&mut value, &mut pkt_type),
+        9 => build_motor_temp_pkt(&mut value, &mut pkt_type),
+        16 | 26 | 36 => {
+            // eeprom reads
+            false
+        }
+        // catch all the undefined ranges
+        _ => false,
+    };
+    unsafe {
+        OUT_SYNC_POS += 1;
+        if OUT_SYNC_POS == 42 {
             OUT_SYNC_POS = 0;
         }
     }
-    State {
-        cpu: state.cpu,
-        exint: state.exint,
-        timer0: state.timer0,
-        timer2: state.timer2,
-        ena_pin: state.ena_pin,
-        enb_pin: state.enb_pin,
-        ina_pin: state.ina_pin,
-        inb_pin: state.inb_pin,
-        pwm_pin: state.pwm_pin,
-        adc: state.adc,
-        machine_state: state.machine_state,
-        prev_state: state.prev_state,
-        timeout: state.timeout,
-        comm_timeout: state.comm_timeout,
-        command_value: state.command_value,
-        lastpos: state.lastpos,
-        max_slew_speed: state.max_slew_speed,
-        max_slew_slow: state.max_slew_slow,
-        max_voltage: state.max_voltage,
-        max_current: state.max_current,
-        max_controller_temp: state.max_controller_temp,
-        max_motor_temp: state.max_motor_temp,
-        rudder_min: state.rudder_min,
-        rudder_max: state.rudder_max,
-        flags: state.flags,
-        pending_cmd: state.pending_cmd,
-        outgoing_state: state.outgoing_state,
+    // check if outgoing packet is ready
+    if use_it {
+        let pkt: [u8; 3] = [
+            pkt_type.into(),
+            (value & 0xFF) as u8,
+            ((value & 0xFF00) >> 8) as u8,
+        ];
+        OutgoingPacketState::Send(pkt)
+    } else {
+        OutgoingPacketState::None
     }
 }

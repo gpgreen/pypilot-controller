@@ -17,6 +17,10 @@ use pypilot_controller_board::pwm;
 use pypilot_controller_board::pwm::Timer0Pwm;
 
 // modules from project
+mod adc;
+use adc::ADC_RESULTS;
+#[macro_use]
+extern crate bitflags;
 mod crc;
 mod packet;
 use packet::OutgoingPacketState;
@@ -24,21 +28,37 @@ use packet::OutgoingPacketState;
 mod serial;
 
 //==========================================================
-// Hardware.flags property masks
+// Hardware.flags
 
-const SYNC: u16 = 1;
-const OVERTEMPFAULT: u16 = 2;
-const OVERCURRENTFAULT: u16 = 4;
-const ENGAGED: u16 = 8;
-const INVALID: u16 = 16;
-const PORTPINFAULT: u16 = 32;
-const STBDPINFAULT: u16 = 64;
-const BADVOLTAGEFAULT: u16 = 128;
-const MINRUDDERFAULT: u16 = 256;
-const MAXRUDDERFAULT: u16 = 512;
-const CURRENTRANGE: u16 = 1024;
-const BADFUSES: u16 = 2048;
-const REBOOTED: u16 = 32768;
+bitflags! {
+    pub struct Flags: u16 {
+    const SYNC = 0b0000_0000_0000_0001;
+    const OVERTEMPFAULT = 0b0000_0000_0000_0010;
+    const OVERCURRENTFAULT = 0b0000_0000_0000_0100;
+    const ENGAGED = 0b0000_0000_0000_1000;
+    const INVALID = 0b0000_0000_0001_0000;
+    const PORTPINFAULT = 0b0000_0000_0010_0000;
+    const STBDPINFAULT = 0b0000_0000_0100_0000;
+    const BADVOLTAGEFAULT = 0b0000_0000_1000_0000;
+    const MINRUDDERFAULT = 0b0000_0001_0000_0000;
+    const MAXRUDDERFAULT = 0b0000_0010_0000_0000;
+    const CURRENTRANGE = 0b0000_0100_0000_0000;
+    const BADFUSES = 0b0000_1000_0000_0000;
+    const REBOOTED = 0b0001_0000_0000_0000;
+    }
+}
+
+impl From<Flags> for u16 {
+    fn from(original: Flags) -> u16 {
+        original.bits
+    }
+}
+
+impl Flags {
+    pub fn clear(&mut self) {
+        self.bits = 0;
+    }
+}
 
 //==========================================================
 
@@ -63,219 +83,6 @@ pub enum CommandToExecute {
 
 //==========================================================
 
-/// adc channels being monitored
-#[derive(Debug, Copy, Clone)]
-pub enum AdcChannel {
-    Current,
-    Voltage,
-    ControllerTemp,
-    MotorTemp,
-    Rudder,
-}
-
-impl From<AdcChannel> for usize {
-    fn from(original: AdcChannel) -> usize {
-        match original {
-            AdcChannel::Current => 0,
-            AdcChannel::Voltage => 1,
-            AdcChannel::ControllerTemp => 2,
-            AdcChannel::MotorTemp => 3,
-            AdcChannel::Rudder => 4,
-        }
-    }
-}
-
-/// adc sample moving averages
-struct AdcMvgAvg {
-    total: [u32; 2],
-    count: [u16; 2],
-}
-
-/// adc sample data for each channel, selected channel, enabled channels
-pub struct AdcResults {
-    enabled: u8,
-    selected: AdcChannel,
-    data: [AdcMvgAvg; 5],
-}
-
-impl AdcResults {
-    /// setup the array, used for setting the enable flags
-    fn setup(&mut self) {
-        // setup the enabled flags, if it hasn't yet been done
-        if self.enabled == 0 {
-            // Current and Voltage are always on
-            let mut enabled_flags = 0x3;
-            if cfg!(controller_temp) {
-                enabled_flags |= 0x4;
-            }
-            if cfg!(motor_temp) {
-                enabled_flags |= 0x8;
-            }
-            if cfg!(rudder_angle) {
-                enabled_flags |= 0x10;
-            }
-            self.enabled = enabled_flags;
-        }
-    }
-
-    /// convert the selected channel to an index into data array
-    #[inline]
-    fn selected_channel(&self) -> usize {
-        self.selected.into()
-    }
-
-    /// is a channel enabled
-    #[inline]
-    fn is_channel_enabled(&self, channel: AdcChannel) -> bool {
-        match channel {
-            AdcChannel::Current => self.enabled & 0x1 == 0x1,
-            AdcChannel::Voltage => self.enabled & 0x2 == 0x2,
-            AdcChannel::ControllerTemp => self.enabled & 0x4 == 0x4,
-            AdcChannel::MotorTemp => self.enabled & 0x8 == 0x8,
-            AdcChannel::Rudder => self.enabled & 0x10 == 0x10,
-        }
-    }
-
-    /// get the adc mux register value for selected channel
-    #[inline]
-    fn adc_mux(&self) -> u8 {
-        //let mux = _BV(REFS0) | _BV(REFS1);
-        let mux = 0xC0
-            & match self.selected {
-                // Current is on ADC1
-                AdcChannel::Current => 0x1,
-                // Voltage on pin ADC0
-                AdcChannel::Voltage => 0x0,
-                // Controller Temp on pin ADC2
-                AdcChannel::ControllerTemp => 0x2,
-                // Motor Temp on pin ADC3
-                AdcChannel::MotorTemp => 0x4,
-                // Rudder angle on pin ADC4
-                AdcChannel::Rudder => 0x8,
-            };
-        mux
-    }
-
-    /// switch to the next adc channel
-    #[inline]
-    fn next_channel(&mut self) {
-        // get the next 'enabled' channel
-        let mut sel = self.selected;
-        loop {
-            let nxt = match sel {
-                AdcChannel::Current => AdcChannel::Voltage,
-                AdcChannel::Voltage => AdcChannel::ControllerTemp,
-                AdcChannel::ControllerTemp => AdcChannel::MotorTemp,
-                AdcChannel::MotorTemp => AdcChannel::Rudder,
-                AdcChannel::Rudder => AdcChannel::Current,
-            };
-            if self.is_channel_enabled(nxt) {
-                self.selected = nxt;
-                break;
-            } else {
-                sel = nxt;
-            }
-        }
-    }
-
-    /// count the results in a channel array
-    pub fn count(&self, channel: AdcChannel, narray: usize) -> u16 {
-        let i: usize = channel.into();
-        self.data[i].count[narray]
-    }
-
-    /// get result in a channel array
-    fn take(&mut self, channel: AdcChannel, narray: usize) -> u16 {
-        let i: usize = channel.into();
-        let (cnt, val) = interrupt::free(|_cs| {
-            let cnt = self.data[i].count[narray];
-            let val = self.data[i].total[narray];
-            self.data[i].total[narray] = 0;
-            self.data[i].count[narray] = 0;
-            (cnt, val)
-        });
-        if cnt == 0 {
-            0
-        } else {
-            let avg: u32 = 16 * val / cnt as u32;
-            avg as u16
-        }
-    }
-
-    /// get current from sample data
-    pub fn take_amps(&mut self, narray: usize) -> u16 {
-        let v = self.take(AdcChannel::Current, narray);
-        v * 9 / 34 / 16
-    }
-
-    /// get voltage from sample data
-    pub fn take_volts(&mut self, narray: usize) -> u16 {
-        // voltage in 10mV increments 1.1ref, 560 and 10k resistors
-        let v = self.take(AdcChannel::Voltage, narray);
-        v * 1790 / 896 / 16
-    }
-
-    /// convert a raw mvg avg value to thermistor temperature
-    #[cfg(any(feature = "controller_temp", feature = "motor_temp"))]
-    fn thermistor_conversion(&self, raw: u32) -> u16 {
-        let r = 100061 * raw / (74464 - raw);
-        (30000000 / (r + 2600) + 200) as u16
-    }
-
-    /// get controller temperature from sample data
-    #[cfg(feature = "controller_temp")]
-    pub fn take_controller_temp(&mut self, narray: usize) -> u16 {
-        let v: u32 = self.take(AdcChannel::ControllerTemp, narray).into();
-        self.thermistor_conversion(v)
-    }
-
-    /// get motor temperature from sample data
-    #[cfg(feature = "motor_temp")]
-    pub fn take_motor_temp(&mut self, narray: usize) -> u16 {
-        let v: u32 = self.take(AdcChannel::MotorTemp, narray).into();
-        self.thermistor_conversion(v)
-    }
-
-    /// get rudder angle from sample data
-    #[cfg(feature = "rudder_angle")]
-    pub fn take_rudder(&mut self, narray: usize) -> u16 {
-        self.take(AdcChannel::Rudder, narray) * 4
-    }
-}
-
-/// static variable for AdcResults and initializer
-static mut ADC_RESULTS: AdcResults = AdcResults {
-    // first channel is current
-    selected: AdcChannel::Current,
-    // which channels are enabled
-    enabled: 0,
-    // AdcMvgAvg struct for each channel
-    data: [
-        AdcMvgAvg {
-            total: [0; 2],
-            count: [0; 2],
-        },
-        AdcMvgAvg {
-            total: [0; 2],
-            count: [0; 2],
-        },
-        AdcMvgAvg {
-            total: [0; 2],
-            count: [0; 2],
-        },
-        AdcMvgAvg {
-            total: [0; 2],
-            count: [0; 2],
-        },
-        AdcMvgAvg {
-            total: [0; 2],
-            count: [0; 2],
-        },
-    ],
-};
-
-//==========================================================
-
 /// the state variables for the hardware
 pub struct State {
     // hardware stuff
@@ -284,6 +91,7 @@ pub struct State {
     timer0: pypilot_controller_board::pwm::Timer0Pwm,
     timer2: pypilot_controller_board::pac::TC2,
     adc: RefCell<avr_device::atmega328p::ADC>,
+    led_pin: RefCell<Option<hal::port::portb::PB5<Output>>>,
     ena_pin: hal::port::portd::PD4<Input<Floating>>,
     enb_pin: hal::port::portd::PD5<Input<Floating>>,
     ina_pin: hal::port::portd::PD2<Output>,
@@ -304,7 +112,7 @@ pub struct State {
     max_motor_temp: u16,
     rudder_min: u16,
     rudder_max: u16,
-    flags: u16,
+    flags: Flags,
     pending_cmd: CommandToExecute,
     outgoing_state: OutgoingPacketState,
 }
@@ -314,23 +122,43 @@ pub struct State {
 #[hal::entry]
 fn main() -> ! {
     let mut state = setup();
+    let mut led_cnt = 0;
+    let mut led_on = true;
+    static mut LED: Option<hal::port::portb::PB5<Output>> = None;
+
     loop {
-        state = serial::process_serial(state);
-        // check if we need to process packet
-        state = match state.pending_cmd {
-            CommandToExecute::ProcessPacket(pkt) => packet::process_packet(pkt, state),
-            _ => state,
-        };
-        // deal with packet induced stop's
-        match state.pending_cmd {
-            CommandToExecute::Stop => stop(&mut state),
-            _ => {}
-        };
-        // build outgoing packet if asked
-        if state.outgoing_state == OutgoingPacketState::Build {
-            state = packet::build_outgoing(state);
+        unsafe {
+            if let Some(led) = &mut LED {
+                if led_cnt == 100 {
+                    led_cnt = 0;
+                    if led_on {
+                        led.set_low().void_unwrap();
+                        led_on = false;
+                    } else {
+                        led.set_high().void_unwrap();
+                        led_on = true;
+                    }
+                } else {
+                    led_cnt += 1;
+                }
+            } else {
+                LED.replace(state.led_pin.replace(None).unwrap());
+            }
         }
+
+        // in serial processing
+        if serial::process_serial(
+            &mut state.flags,
+            &mut state.pending_cmd,
+            &mut state.outgoing_state,
+        ) {
+            state.comm_timeout = 0;
+        }
+
         state = process_fsm(state);
+
+        // out serial processing
+        serial::send_serial(&mut state.outgoing_state);
     }
 }
 
@@ -440,7 +268,10 @@ fn setup() -> State {
     let enb_pin = pins.d5.into_floating_input(&mut pins.ddr);
 
     // SPI pins
-    let _sck = pins.d13.into_pull_up_input(&mut pins.ddr);
+    let mut led = pins.d13.into_output(&mut pins.ddr);
+    led.set_high().void_unwrap();
+
+    //let _sck = pins.d13.into_pull_up_input(&mut pins.ddr);
     let _miso = pins.d12.into_output(&mut pins.ddr);
     let _mosi = pins.d11.into_pull_up_input(&mut pins.ddr);
     let _cs = pins.d10.into_pull_up_input(&mut pins.ddr);
@@ -456,9 +287,11 @@ fn setup() -> State {
         pins.tx.into_output(&mut pins.ddr),
         57600.into_baudrate(),
     );
-    // turn on RX interrupt
+    // turn on RX and UDRE interrupt
     #[cfg(any(debug_assertions, feature = "serial_packets"))]
     serial.listen(hal::usart::Event::RxComplete);
+    #[cfg(any(debug_assertions, feature = "serial_packets"))]
+    serial.listen(hal::usart::Event::DataRegisterEmpty);
     // split into reader and write and send to static variables
     #[cfg(any(debug_assertions, feature = "serial_packets"))]
     let (reader, writer) = serial.split();
@@ -509,6 +342,7 @@ fn setup() -> State {
         inb_pin: inb_pin,
         pwm_pin: pwm_pin,
         adc: RefCell::new(adc),
+        led_pin: RefCell::new(Some(led)),
         machine_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
         prev_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
         timeout: 0,
@@ -527,7 +361,7 @@ fn setup() -> State {
         max_motor_temp: 7000,
         rudder_min: 0,
         rudder_max: 65535,
-        flags: 0x00,
+        flags: Flags::empty(),
         pending_cmd: CommandToExecute::None,
         outgoing_state: OutgoingPacketState::None,
     }
@@ -642,7 +476,7 @@ fn position(state: &mut State, value: u16) {
     } else {
         (1000 - value) / 4
     };
-    state.pwm_pin.set_duty(newpos.try_into().unwrap());
+    state.pwm_pin.set_duty(newpos.try_into().unwrap_or(0));
     if value > 1040 {
         state.ina_pin.set_low().unwrap();
         state.inb_pin.set_high().unwrap();
@@ -654,37 +488,6 @@ fn position(state: &mut State, value: u16) {
         state.ina_pin.set_low().unwrap();
         state.inb_pin.set_low().unwrap();
     }
-    /*
-    State {
-        cpu: state.cpu,
-        exint: state.exint,
-        timer0: state.timer0,
-        timer2: state.timer2,
-        ena_pin: state.ena_pin,
-        enb_pin: state.enb_pin,
-        ina_pin: state.ina_pin,
-        inb_pin: state.inb_pin,
-        pwm_pin: state.pwm_pin,
-        adc: state.adc,
-        machine_state: state.machine_state,
-        prev_state: state.prev_state,
-        timeout: state.timeout,
-        comm_timeout: state.comm_timeout,
-        command_value: state.command_value,
-        lastpos: state.lastpos,
-        max_slew_speed: state.max_slew_speed,
-        max_slew_slow: state.max_slew_slow,
-        max_voltage: state.max_voltage,
-        max_current: state.max_current,
-        max_controller_temp: state.max_controller_temp,
-        max_motor_temp: state.max_motor_temp,
-        rudder_min: state.rudder_min,
-        rudder_max: state.rudder_max,
-        flags: state.flags,
-        pending_cmd: state.pending_cmd,
-        outgoing_state: state.outgoing_state,
-    }
-    */
 }
 
 //==========================================================
@@ -706,6 +509,25 @@ fn process_fsm(mut state: State) -> State {
             false
         }
     });
+
+    // process packet
+    match state.pending_cmd {
+        CommandToExecute::ProcessPacket(pkt) => packet::process_packet(pkt, &mut state),
+        CommandToExecute::Stop => {
+            stop(&mut state);
+            state.pending_cmd = CommandToExecute::None;
+        }
+        _ => {}
+    }
+    // check for stop again from process packet
+    if state.pending_cmd == CommandToExecute::Stop {
+        stop(&mut state);
+    }
+
+    // build outgoing packet if asked
+    if state.outgoing_state == OutgoingPacketState::Build {
+        state.outgoing_state = packet::build_outgoing(&state);
+    }
 
     // FSM
     let newstate = match state.machine_state.0 {
@@ -729,7 +551,7 @@ fn process_fsm(mut state: State) -> State {
         }
         PyPilotStateMachine::Engage => {
             state.timeout = 0;
-            state.flags |= ENGAGED;
+            state.flags.insert(Flags::ENGAGED);
             // start PWM
             state.ina_pin.set_low().void_unwrap();
             state.ina_pin.set_low().void_unwrap();
@@ -740,13 +562,25 @@ fn process_fsm(mut state: State) -> State {
         }
         PyPilotStateMachine::Operational => {
             if do_update {
-                let speed_rate: i16 = state.max_slew_speed.into();
+                let speed_rate: i16 = match state.max_slew_speed.try_into() {
+                    Ok(v) => v,
+                    Err(_) => 250,
+                };
                 // value of 20 is 1 second full range at 50hz
-                let slow_rate: i16 = state.max_slew_slow.into();
-                let cur_value: u16 = state.lastpos;
+                let slow_rate: i16 = match state.max_slew_slow.try_into() {
+                    Ok(v) => v,
+                    Err(_) => 250,
+                };
+                let cmd_value: i16 = match state.command_value.try_into() {
+                    Ok(v) => v,
+                    Err(_) => 1000,
+                };
+                let cur_value: i16 = match state.lastpos.try_into() {
+                    Ok(v) => v,
+                    Err(_) => 1000,
+                };
                 // this should always be in range
-                let mut diff: i16 = (state.command_value - cur_value).try_into().unwrap();
-
+                let mut diff = cmd_value - cur_value;
                 // limit motor speed change to within speed and slow slew rates
                 if diff > 0 {
                     if cur_value < 1000 {
@@ -769,15 +603,15 @@ fn process_fsm(mut state: State) -> State {
                         }
                     }
                 }
-                let mut new_pos = cur_value;
+                let mut new_pos = state.lastpos;
                 if diff < 0 {
-                    if (-diff) as u16 > cur_value {
+                    if (-diff) as u16 > state.lastpos {
                         new_pos = 0;
                     } else {
                         new_pos -= (-diff) as u16;
                     }
                 } else if diff > 0 {
-                    if diff as u16 + cur_value > 2000 {
+                    if diff as u16 + state.lastpos > 2000 {
                         new_pos = 2000;
                     } else {
                         new_pos += diff as u16;
@@ -794,7 +628,7 @@ fn process_fsm(mut state: State) -> State {
         }
         PyPilotStateMachine::DisengageEntry => {
             stop(&mut state);
-            state.flags &= !ENGAGED;
+            state.flags.remove(Flags::ENGAGED);
             if state.pending_cmd == CommandToExecute::Engage {
                 change_state(PyPilotStateMachine::Engage, state.machine_state)
             } else {
@@ -827,21 +661,21 @@ fn process_fsm(mut state: State) -> State {
             }
         }
         PyPilotStateMachine::PowerDown => {
-            //#[cfg(any(debug_assertions, feature = "serial_packets"))]
-            //nb::block!(state.serial.flush()).void_unwrap();
             // cpu goes to sleep, then woken up
             power_down_mode(&mut state);
             state.timeout = 0;
             state.comm_timeout = state.comm_timeout - 250;
             state.command_value = 1000;
             state.lastpos = 1000;
+            state.flags.clear();
             state.pending_cmd = CommandToExecute::None;
+            state.outgoing_state = OutgoingPacketState::None;
             change_state(PyPilotStateMachine::WaitEntry, state.machine_state)
         }
     };
     // check and see if machine state has changed, if so, send it via serial port
     if state.prev_state.0 != state.machine_state.0 || state.prev_state.1 != state.machine_state.1 {
-        //#[cfg(any(debug_assertions, feature = "serial_packets"))]
+        //#[cfg(debug_assertions)]
         //serial::send_tuple(&mut state);
         state.prev_state = state.machine_state;
     }
@@ -856,6 +690,7 @@ fn process_fsm(mut state: State) -> State {
         inb_pin: state.inb_pin,
         pwm_pin: state.pwm_pin,
         adc: state.adc,
+        led_pin: state.led_pin,
         machine_state: newstate,
         prev_state: state.prev_state,
         timeout: state.timeout,
@@ -871,7 +706,7 @@ fn process_fsm(mut state: State) -> State {
         rudder_min: state.rudder_min,
         rudder_max: state.rudder_max,
         flags: state.flags,
-        pending_cmd: CommandToExecute::None,
+        pending_cmd: state.pending_cmd,
         outgoing_state: state.outgoing_state,
     }
 }
@@ -884,56 +719,6 @@ static mut PENDINGPCINT2: bool = false;
 fn PCINT2() {
     unsafe {
         ptr::write_volatile(&mut PENDINGPCINT2, true);
-    }
-}
-
-//==========================================================
-
-#[interrupt(atmega328p)]
-fn ADC() {
-    static mut SAMPLE_CNT: u8 = 0;
-    // unsafe is ok here, because we are in interrupt context
-    // avr interrupts aren't nesting
-    // we are modifying the ADC_RESULTS static structure
-    // so can't reenable interrupts till this isr is finished
-    // we are using the raw pointer to ADC registers also, due
-    // to the same reason
-    unsafe {
-        // magic address
-        const ADCW_REG: u16 = 0x78;
-        // get the sample value
-        let sample = ptr::read_volatile(ADCW_REG as *mut u16);
-        // add the sample to the array
-        let sel = ADC_RESULTS.selected_channel();
-        SAMPLE_CNT += 1;
-        // throw out the first 3 samples
-        if SAMPLE_CNT > 3 {
-            for i in 0..2 {
-                if ADC_RESULTS.data[sel].count[i] < 4000 {
-                    ADC_RESULTS.data[sel].total[i] += sample as u32;
-                    ADC_RESULTS.data[sel].count[i] += 1;
-                }
-            }
-        }
-        // check to see if we need more samples for this channel
-        let do_more = match ADC_RESULTS.selected {
-            AdcChannel::Current => SAMPLE_CNT < 50,
-            AdcChannel::Voltage => SAMPLE_CNT < 8,
-            AdcChannel::Rudder => SAMPLE_CNT < 16,
-            _ => false,
-        };
-        if !do_more {
-            SAMPLE_CNT = 0;
-            ADC_RESULTS.next_channel();
-            // magic address
-            const ADCMUX_REG: u8 = 0x7C;
-            // write the mux
-            ptr::write_volatile(ADCMUX_REG as *mut u8, ADC_RESULTS.adc_mux());
-        }
-        // do the next conversion
-        // magic address
-        const ADCSRA_REG: u8 = 0x7A;
-        ptr::write_volatile(ADCSRA_REG as *mut u8, 0xC8);
     }
 }
 
