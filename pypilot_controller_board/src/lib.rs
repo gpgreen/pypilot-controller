@@ -192,7 +192,7 @@ pub mod pwm {
 /// ```
 ///
 /// [ex-serial]: https://github.com/Rahix/avr-hal/blob/master/boards/chart-plotter-hat/examples/cph-serial.rs
-pub type Serial<IMODE> = hal::usart::Usart0<hal::clock::MHz8, IMODE>;
+pub type Serial<IMODE> = hal::usart::Usart0<hal::clock::MHz16, IMODE>;
 
 /// Support for the WatchDog Timer
 ///

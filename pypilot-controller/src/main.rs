@@ -13,8 +13,8 @@ use core::ptr;
 use hal::port::mode::{Floating, Input, Output, Pwm};
 use pypilot_controller_board::hal;
 use pypilot_controller_board::prelude::*;
-use pypilot_controller_board::pwm;
-use pypilot_controller_board::pwm::Timer0Pwm;
+use pypilot_controller_board::pwm::{Prescaler, Timer0Pwm};
+use pypilot_controller_board::wdt::{Timeout, Wdt};
 
 // modules from project
 mod adc;
@@ -24,6 +24,7 @@ extern crate bitflags;
 mod crc;
 mod packet;
 use packet::OutgoingPacketState;
+mod eeprom;
 #[cfg(feature = "serial_packets")]
 mod serial;
 
@@ -97,6 +98,8 @@ pub struct State {
     ina_pin: hal::port::portd::PD2<Output>,
     inb_pin: hal::port::portd::PD3<Output>,
     pwm_pin: hal::port::portd::PD6<Pwm<Timer0Pwm>>,
+    wdt: hal::wdt::Wdt,
+    eeprom: avr_device::atmega328p::EEPROM,
     // state stuff
     machine_state: (PyPilotStateMachine, PyPilotStateMachine),
     prev_state: (PyPilotStateMachine, PyPilotStateMachine),
@@ -127,6 +130,7 @@ fn main() -> ! {
     static mut LED: Option<hal::port::portb::PB5<Output>> = None;
 
     loop {
+        state.wdt.feed();
         unsafe {
             if let Some(led) = &mut LED {
                 if led_cnt == 100 {
@@ -147,6 +151,7 @@ fn main() -> ! {
         }
 
         // in serial processing
+        #[cfg(feature = "serial_packets")]
         if serial::process_serial(
             &mut state.flags,
             &mut state.pending_cmd,
@@ -158,6 +163,7 @@ fn main() -> ! {
         state = process_fsm(state);
 
         // out serial processing
+        #[cfg(feature = "serial_packets")]
         serial::send_serial(&mut state.outgoing_state);
     }
 }
@@ -245,17 +251,17 @@ fn setup() -> State {
 
     #[cfg(not(debug_assertions))]
     #[cfg(not(feature = "serial_packets"))]
-    let _rx = pins.rx.into_pull_up_input(&mut pins.ddr);
+    pins.rx.into_pull_up_input(&mut pins.ddr);
     #[cfg(not(debug_assertions))]
     #[cfg(not(feature = "serial_packets"))]
-    let _tx = pins.tx.into_pull_up_input(&mut pins.ddr);
+    pins.tx.into_pull_up_input(&mut pins.ddr);
 
     // turn on timer2
     let timer2 = dp.TC2;
     timer2.tccr2b.modify(|_, w| w.cs2().prescale_1024());
 
     // pwm
-    let mut timer0 = pwm::Timer0Pwm::new(dp.TC0, pwm::Prescaler::Prescale8);
+    let mut timer0 = Timer0Pwm::new(dp.TC0, Prescaler::Prescale8);
     let pwm_pin = pins.d6.into_output(&mut pins.ddr).into_pwm(&mut timer0);
     // clockwise
     let ina_pin = pins.d2.into_output(&mut pins.ddr);
@@ -280,23 +286,15 @@ fn setup() -> State {
     // now module setup
 
     // setup serial
-    #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    let mut serial = pypilot_controller_board::Serial::<Floating>::new(
+    #[cfg(feature = "serial_packets")]
+    let uart0 = pypilot_controller_board::Serial::<Floating>::new(
         dp.USART0,
         pins.rx,
         pins.tx.into_output(&mut pins.ddr),
-        57600.into_baudrate(),
+        115200.into_baudrate(),
     );
-    // turn on RX and UDRE interrupt
-    #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    serial.listen(hal::usart::Event::RxComplete);
-    #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    serial.listen(hal::usart::Event::DataRegisterEmpty);
-    // split into reader and write and send to static variables
-    #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    let (reader, writer) = serial.split();
-    #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    serial::setup_serial(reader, writer);
+    #[cfg(feature = "serial_packets")]
+    serial::setup_serial(uart0);
 
     // setup adc, not using the HAL, because it doesn't do interrupts
     let adc = dp.ADC;
@@ -331,6 +329,11 @@ fn setup() -> State {
         ADC_RESULTS.setup();
         interrupt::enable();
     }
+
+    // watchdog
+    let mut watchdog = Wdt::new(&cpu.mcusr, dp.WDT);
+    watchdog.start(Timeout::Ms250);
+
     State {
         cpu: cpu,
         exint: dp.EXINT,
@@ -343,6 +346,8 @@ fn setup() -> State {
         pwm_pin: pwm_pin,
         adc: RefCell::new(adc),
         led_pin: RefCell::new(Some(led)),
+        wdt: watchdog,
+        eeprom: dp.EEPROM,
         machine_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
         prev_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
         timeout: 0,
@@ -469,8 +474,8 @@ fn stop(state: &mut State) {
 
 /// update the pwm based on motor command
 fn position(state: &mut State, value: u16) {
-    // foPWM = fclk/(prescale*256)
-    // foPWM = 3.906kHz
+    // foPWM = fclk/(prescale*256),prescale=8
+    // foPWM = 7.8125kHz
     let newpos = if value >= 1000 {
         (value - 1000) / 4
     } else {
@@ -494,8 +499,10 @@ fn position(state: &mut State, value: u16) {
 
 /// the main state machine processer
 fn process_fsm(mut state: State) -> State {
-    // first check the times, set do_update boolean
-    // if motor position should be updated
+    // check timer2 counter, boolean 'do_update' s/b set
+    // if motor position to be updated
+    // timer2 is set to 1024 prescale, so each timer tick=15625hz=64ns
+    // that means each update is at 5ms
     let do_update = interrupt::free(|_cs| {
         let ticks = state.timer2.tcnt2.read().bits();
         if ticks > 78 {
@@ -519,7 +526,7 @@ fn process_fsm(mut state: State) -> State {
         }
         _ => {}
     }
-    // check for stop again from process packet
+    // check for stop from process packet
     if state.pending_cmd == CommandToExecute::Stop {
         stop(&mut state);
     }
@@ -605,13 +612,15 @@ fn process_fsm(mut state: State) -> State {
                 }
                 let mut new_pos = state.lastpos;
                 if diff < 0 {
-                    if (-diff) as u16 > state.lastpos {
+                    // check if potential pos is less 0
+                    if (-diff) as u16 > new_pos {
                         new_pos = 0;
                     } else {
                         new_pos -= (-diff) as u16;
                     }
                 } else if diff > 0 {
-                    if diff as u16 + state.lastpos > 2000 {
+                    // check if potential pos is greater 2000
+                    if diff as u16 + new_pos > 2000 {
                         new_pos = 2000;
                     } else {
                         new_pos += diff as u16;
@@ -673,7 +682,7 @@ fn process_fsm(mut state: State) -> State {
             change_state(PyPilotStateMachine::WaitEntry, state.machine_state)
         }
     };
-    // check and see if machine state has changed, if so, send it via serial port
+    // check and see if machine state has changed
     if state.prev_state.0 != state.machine_state.0 || state.prev_state.1 != state.machine_state.1 {
         //#[cfg(debug_assertions)]
         //serial::send_tuple(&mut state);
@@ -691,6 +700,8 @@ fn process_fsm(mut state: State) -> State {
         pwm_pin: state.pwm_pin,
         adc: state.adc,
         led_pin: state.led_pin,
+        wdt: state.wdt,
+        eeprom: state.eeprom,
         machine_state: newstate,
         prev_state: state.prev_state,
         timeout: state.timeout,

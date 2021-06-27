@@ -86,8 +86,9 @@ def handle_recvd_pkt(pkt):
         if val & 0x1000:
             flags.append("REBOOT")
         s += "\nFlags: {}".format(" ".join(flags))
+        flags_var.set("".join(flags))
     elif pkt[0] == 0x9a:
-        s += "\nEEPROMValue: {}".format(val)
+        s += "\nEEPROM[{}]: 0x{:02x}".format(val & 0xFF, val >> 8)
     write_to_serial_widget(s + '\n')
     
     
@@ -122,17 +123,36 @@ def send_packet(pkt):
     
 def write_to_serial_widget(s):
     numlines = int(serial_output.index('end - 1 line').split('.')[0])
+    print("numlines:",numlines)
     serial_output['state'] = 'normal'
     if numlines == 20:
         serial_output.delete(1.0, 2.0)
     serial_output.insert('end', s)
     serial_output['state'] = 'disabled'
+
+def write_eeprom():
+    addr = int(write_addr_var.get())
+    byte_val = int(write_byte_var.get())
+    if byte_val >= 0 and byte_val <= 256:
+        print("write eeprom[{}]: 0x{:02x}".format(addr, byte_val))
+        send_packet(build_pkt(0x53, addr + (byte_val << 8)))
+    else:
+        print("invalid eeprom write value")
     
+def read_eeprom():
+    start_addr = int(start_var.get())
+    end_addr = int(end_var.get())
+    if start_addr < end_addr:
+        print("read eeprom[{}] -> [{}]".format(start_addr, end_addr))
+        send_packet(build_pkt(0x91, start_addr + (end_addr << 8)))
+    else:
+        print("read range invalid")
+
 def poll_serial():
     global msg
-    read_byte = serial_port.read()
-    if len(read_byte) != 0:
-        msg = msg + read_byte
+    read_bytes = serial_port.read()
+    if len(read_bytes) != 0:
+        msg += read_bytes
         #print("buf:{}".format(msg.hex()))
         if len(msg) >= 4:
             pkt = msg[:3]
@@ -152,8 +172,7 @@ def update_position(val):
     print("Position:", val, pos)
     try:
         if serial_port and engaged and pos >= -2000 and pos <= 2000:
-            pkt = build_pkt(0xc7, pos)
-            send_packet(pkt)
+            send_packet(build_pkt(0xc7, pos))
     except NameError:
         # this happens when widget is initialized
         pass
@@ -165,8 +184,7 @@ def engage():
     
 def reset(*args):
     print("reset")
-    pkt = build_pkt(0xe7, 0)
-    send_packet(pkt)
+    send_packet(build_pkt(0xe7, 0))
 
 def disengage(*args):
     global engaged
@@ -183,25 +201,46 @@ mainframe.grid(column=0, row=0, sticky=(N, W, E, S))
 root.columnconfigure(0, weight=1)
 root.rowconfigure(0, weight=1)
 
+
+ttk.Label(mainframe, text="position").grid(column=1, row=1, sticky=W)
 position_scale = ttk.Scale(mainframe, orient=HORIZONTAL, length=200, from_=0, to=200, command=update_position)
 position_scale.set(100)
-position_scale.grid(column=2, row=1, sticky=(W, E))
+position_scale.grid(column=2, row=1, columnspan=3)
 
 ttk.Button(mainframe, text="Engage", command=engage).grid(column=1, row=2, sticky=W)
 ttk.Button(mainframe, text="Disengage", command=disengage).grid(column=2, row=2, sticky=W)
 ttk.Button(mainframe, text="Reset", command=reset).grid(column=3, row=2, sticky=W)
 
-flags = StringVar()
-ttk.Label(mainframe, textvariable=flags).grid(column=1, row=3, sticky=(W, E))
+ttk.Label(mainframe, text="Flags:").grid(column=1, row=3, sticky=W)
+flags_var = StringVar()
+ttk.Entry(mainframe, textvariable=flags_var).grid(column=2, row=3, columnspan=3)
+
+ttk.Button(mainframe, text="Read EEPROM", command=read_eeprom).grid(column=1, row=4)
+ttk.Label(mainframe, text="start address").grid(column=2, row=4, sticky=E)
+start_var = StringVar()
+ttk.Entry(mainframe, textvariable=start_var).grid(column=3, row=4)
+start_var.set("0")
+ttk.Label(mainframe, text="end address").grid(column=4, row=4, sticky=E)
+end_var = StringVar()
+ttk.Entry(mainframe, textvariable=end_var).grid(column=5, row=4)
+end_var.set("0")
+
+ttk.Button(mainframe, text="Write EEPROM", command=write_eeprom).grid(column=1, row=5)
+ttk.Label(mainframe, text="address").grid(column=2, row=5, sticky=E)
+write_addr_var = StringVar()
+ttk.Entry(mainframe, textvariable=write_addr_var).grid(column=3, row=5)
+write_addr_var.set("0")
+ttk.Label(mainframe, text="byte").grid(column=4, row=5, sticky=E)
+write_byte_var = StringVar()
+ttk.Entry(mainframe, textvariable=write_byte_var).grid(column=5, row=5)
+write_byte_var.set("0")
+
+ttk.Label(mainframe, text="serial output").grid(column=1, row=6, sticky=W)
 
 serial_output = Text(mainframe, width=80, height=20)
-serial_output.grid(column=1, row=5, sticky=(W, E))
+serial_output.grid(column=1, row=7, columnspan=5)
 txt = serial_output.get('1.0', 'end')
 print("txt:", txt)
-
-ttk.Label(mainframe, text="position").grid(column=1, row=1, sticky=W)
-ttk.Label(mainframe, text="flags").grid(column=1, row=3, sticky=W)
-ttk.Label(mainframe, text="serial output").grid(column=1, row=4, sticky=W)
 
 for child in mainframe.winfo_children(): 
     child.grid_configure(padx=5, pady=5)

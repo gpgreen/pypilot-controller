@@ -10,17 +10,23 @@ use heapless::spsc::{Consumer, Producer, Queue};
 use pypilot_controller_board::hal;
 use pypilot_controller_board::prelude::*;
 
+type Serial = pypilot_controller_board::hal::usart::Usart<
+    pypilot_controller_board::pac::USART0,
+    hal::port::portd::PD0<Input<Floating>>,
+    hal::port::portd::PD1<Output>,
+    hal::clock::MHz16,
+>;
 type SerialWriter = pypilot_controller_board::hal::usart::UsartWriter<
     pypilot_controller_board::pac::USART0,
     hal::port::portd::PD0<Input<Floating>>,
     hal::port::portd::PD1<Output>,
-    hal::clock::MHz8,
+    hal::clock::MHz16,
 >;
 type SerialReader = pypilot_controller_board::hal::usart::UsartReader<
     pypilot_controller_board::pac::USART0,
     hal::port::portd::PD0<Input<Floating>>,
     hal::port::portd::PD1<Output>,
-    hal::clock::MHz8,
+    hal::clock::MHz16,
 >;
 //==========================================================
 
@@ -92,9 +98,14 @@ fn transmit_bytes(bytes: &[u8]) -> usize {
 //==========================================================
 
 /// setup the queues, move them into the static variables so they can be moved into the fns
-pub fn setup_serial(reader: SerialReader, writer: SerialWriter) {
+pub fn setup_serial(mut serial: Serial) {
     static mut READ_QUEUE: Queue<u8, 64> = Queue::new();
     static mut WRITE_QUEUE: Queue<u8, 64> = Queue::new();
+
+    serial.listen(hal::usart::Event::RxComplete);
+    serial.listen(hal::usart::Event::DataRegisterEmpty);
+    // split into reader and write and send to static variables
+    let (reader, writer) = serial.split();
 
     // SAFETY: the queues are in a interrupt::free context so access is safe
     unsafe {

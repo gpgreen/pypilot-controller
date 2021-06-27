@@ -1,4 +1,7 @@
-use crate::{adc::AdcChannel, CommandToExecute, Flags, State, ADC_RESULTS, LOWCURRENT};
+use crate::{
+    adc::AdcChannel, eeprom::eeprom_read8, eeprom::eeprom_update8, CommandToExecute, Flags, State,
+    ADC_RESULTS, LOWCURRENT,
+};
 use core::convert::TryFrom;
 
 //==========================================================
@@ -106,6 +109,13 @@ impl TryFrom<u8> for PacketType {
         }
     }
 }
+
+//==========================================================
+
+/// the current address to be read from eeprom
+static mut EEPROM_READ_ADDR: u8 = 0;
+/// the last address to be read from eeprom
+static mut EEPROM_END_ADDR: u8 = 0;
 
 //==========================================================
 
@@ -265,8 +275,16 @@ pub fn process_packet(pkt: [u8; 3], state: &mut State) {
                     state.max_slew_slow = 1;
                 }
             }
-            PacketType::EEPROMReadCode => {}
-            PacketType::EEPROMWriteCode => {}
+            PacketType::EEPROMReadCode => {
+                // SAFETY: these statics are only used here in main loop sequence
+                unsafe {
+                    if EEPROM_READ_ADDR == EEPROM_END_ADDR {
+                        EEPROM_READ_ADDR = pkt[1];
+                        EEPROM_END_ADDR = pkt[2];
+                    }
+                }
+            }
+            PacketType::EEPROMWriteCode => eeprom_update8(&state, pkt[1] as u16, pkt[2]),
             PacketType::ReprogramCode => {}
             PacketType::ResetCode => state.flags.remove(Flags::OVERCURRENTFAULT),
             PacketType::RudderRangeCode => {}
@@ -298,6 +316,7 @@ pub fn build_outgoing(state: &State) -> OutgoingPacketState {
     }
     let mut value: u16 = 0;
     let mut pkt_type = PacketType::InvalidCode;
+    let mut skip_out_sync = false;
 
     let use_it = match current_pos {
         0 | 10 | 20 | 30 => {
@@ -316,16 +335,31 @@ pub fn build_outgoing(state: &State) -> OutgoingPacketState {
         6 => build_controller_temp_pkt(&mut value, &mut pkt_type),
         9 => build_motor_temp_pkt(&mut value, &mut pkt_type),
         16 | 26 | 36 => {
-            // eeprom reads
-            false
+            // SAFETY: these statics are only used in main loop sequence
+            unsafe {
+                if EEPROM_READ_ADDR != EEPROM_END_ADDR {
+                    value = (eeprom_read8(&state, EEPROM_READ_ADDR as u16) as u16) << 8
+                        | EEPROM_READ_ADDR as u16;
+                    pkt_type = PacketType::EEPROMValueCode;
+                    skip_out_sync = true;
+                    // increment address
+                    EEPROM_READ_ADDR += 1;
+                    true
+                } else {
+                    // no eeprom reads
+                    false
+                }
+            }
         }
         // catch all the undefined ranges
         _ => false,
     };
-    unsafe {
-        OUT_SYNC_POS += 1;
-        if OUT_SYNC_POS == 42 {
-            OUT_SYNC_POS = 0;
+    if !skip_out_sync {
+        unsafe {
+            OUT_SYNC_POS += 1;
+            if OUT_SYNC_POS == 42 {
+                OUT_SYNC_POS = 0;
+            }
         }
     }
     // check if outgoing packet is ready
