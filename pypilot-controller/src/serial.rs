@@ -49,6 +49,7 @@ static mut USARTREADER: Mutex<RefCell<Option<SerialReader>>> = Mutex::new(RefCel
 static mut USARTWRITER: Mutex<RefCell<Option<SerialWriter>>> = Mutex::new(RefCell::new(None));
 
 /// utility function for getting next available byte received on USART
+#[inline]
 fn get_next_byte() -> Option<u8> {
     // SAFETY: dequeue is a lockless function
     unsafe {
@@ -61,6 +62,7 @@ fn get_next_byte() -> Option<u8> {
 }
 
 /// utility function for putting bytes into transmit queue for USART
+#[inline]
 fn transmit_bytes(bytes: &[u8]) -> usize {
     let mut count: usize = 0;
     // SAFETY: queue in a interrupt::free context so access is safe
@@ -124,6 +126,7 @@ pub fn setup_serial(mut serial: Serial) {
 }
 
 /// if outgoing state says to send a packet, do so
+#[inline]
 pub fn send_serial(outgoing_state: &mut OutgoingPacketState) {
     // process outgoing packet if necessary
     *outgoing_state = match *outgoing_state {
@@ -150,46 +153,54 @@ pub fn process_serial(
     static mut SYNC_B: usize = 0;
     static mut IN_SYNC_COUNT: u8 = 0;
 
+    // if there are no bytes waiting, return
+    unsafe {
+        if let Some(q) = &READ_CONSUME_QUEUE {
+            if !q.ready() {
+                return false;
+            }
+        };
+    }
+
     let mut reset_comm_timeout = false;
-    loop {
-        match get_next_byte() {
-            Some(word) => {
-                // reset the serial timeout now, since we've received data
-                //state.comm_timeout = 0;
-                reset_comm_timeout = true;
-                // SAFETY: this is safe because none of these static structures are modified
-                // elsewhere, they are only used here in this function
-                unsafe {
-                    if SYNC_B < 3 {
-                        IN_BYTES[SYNC_B] = word;
-                        SYNC_B += 1;
-                    } else {
-                        let pkt_crc = crc::crc8(IN_BYTES);
-                        if word == pkt_crc {
-                            SYNC_B = 0;
-                            if IN_SYNC_COUNT >= 2 {
-                                *pending_cmd = CommandToExecute::ProcessPacket(IN_BYTES);
-                            } else {
-                                IN_SYNC_COUNT += 1;
-                            }
-                            flags.insert(Flags::SYNC);
-                            flags.remove(Flags::INVALID);
-                            *outgoing_state = OutgoingPacketState::Build;
+    for _i in 0..3 {
+        if let Some(word) = get_next_byte() {
+            // reset the serial timeout now, since we've received data
+            //state.comm_timeout = 0;
+            reset_comm_timeout = true;
+            // SAFETY: this is safe because none of these static structures are modified
+            // elsewhere, they are only used here in this function
+            unsafe {
+                if SYNC_B < 3 {
+                    IN_BYTES[SYNC_B] = word;
+                    SYNC_B += 1;
+                } else {
+                    let pkt_crc = crc::crc8(IN_BYTES);
+                    if word == pkt_crc {
+                        SYNC_B = 0;
+                        if IN_SYNC_COUNT >= 2 {
+                            *pending_cmd = CommandToExecute::ProcessPacket(IN_BYTES);
                         } else {
-                            // invalid packet
-                            IN_SYNC_COUNT = 0;
-                            IN_BYTES[0] = IN_BYTES[1];
-                            IN_BYTES[1] = IN_BYTES[2];
-                            IN_BYTES[2] = word;
-                            flags.remove(Flags::SYNC);
-                            flags.insert(Flags::INVALID);
-                            //*outgoing_state = OutgoingPacketState::Build;
-                            *pending_cmd = CommandToExecute::Stop;
+                            IN_SYNC_COUNT += 1;
                         }
+                        flags.insert(Flags::SYNC);
+                        flags.remove(Flags::INVALID);
+                        *outgoing_state = OutgoingPacketState::Build;
+                    } else {
+                        // invalid packet
+                        IN_SYNC_COUNT = 0;
+                        IN_BYTES[0] = IN_BYTES[1];
+                        IN_BYTES[1] = IN_BYTES[2];
+                        IN_BYTES[2] = word;
+                        flags.remove(Flags::SYNC);
+                        flags.insert(Flags::INVALID);
+                        //*outgoing_state = OutgoingPacketState::Build;
+                        *pending_cmd = CommandToExecute::Stop;
                     }
                 }
             }
-            None => break,
+        } else {
+            break;
         }
     }
     reset_comm_timeout

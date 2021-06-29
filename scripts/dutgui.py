@@ -40,23 +40,24 @@ def state_decode(state):
     return s
 
 def handle_recvd_pkt(pkt):
-    s = "recvd:{} Ok CRC".format(pkt.hex())
+    #s = "recvd:{} Ok CRC".format(pkt.hex())
+    s = ""
     val = struct.unpack("<H", pkt[1:])[0]
     print("code: {:x} val:{}".format(pkt[0], val))
     if pkt[0] == 0x20:
-        s += "\nCurrent: " + state_decode(val)
+        s += "Current: " + state_decode(val)
     elif pkt[0] == 0x21:
-        s += "\nPrevious: " + state_decode(val)
+        s += "Previous: " + state_decode(val)
     elif pkt[0] == 0x1c:
-        s += "\nCurrent: {}".format(val)
+        s += "Current: {}".format(val)
     elif pkt[0] == 0xb3:
-        s += "\nVoltage: {}".format(val)
+        s += "Voltage: {}".format(val)
     elif pkt[0] == 0xf9:
-        s += "\nController Temp: {}".format(val)
+        s += "Controller Temp: {}".format(val)
     elif pkt[0] == 0x48:
-        s += "\nMotor Temp: {}".format(val)
+        s += "Motor Temp: {}".format(val)
     elif pkt[0] == 0xa7:
-        s += "\nRudder Angle: {}".format(val)
+        s += "Rudder Angle: {}".format(val)
     elif pkt[0] == 0x8f:
         flags = []
         if val & 0x1:
@@ -85,10 +86,10 @@ def handle_recvd_pkt(pkt):
             flags.append("BADFUSE")
         if val & 0x1000:
             flags.append("REBOOT")
-        s += "\nFlags: {}".format(" ".join(flags))
+        s += "Flags: {}".format(" ".join(flags))
         flags_var.set("".join(flags))
     elif pkt[0] == 0x9a:
-        s += "\nEEPROM[{}]: 0x{:02x}".format(val & 0xFF, val >> 8)
+        s += "EEPROM[{}]: 0x{:02x}".format(val & 0xFF, val >> 8)
     write_to_serial_widget(s + '\n')
     
     
@@ -123,7 +124,7 @@ def send_packet(pkt):
     
 def write_to_serial_widget(s):
     numlines = int(serial_output.index('end - 1 line').split('.')[0])
-    print("numlines:",numlines)
+    #print("numlines:",numlines)
     serial_output['state'] = 'normal'
     if numlines == 20:
         serial_output.delete(1.0, 2.0)
@@ -207,9 +208,9 @@ position_scale = ttk.Scale(mainframe, orient=HORIZONTAL, length=200, from_=0, to
 position_scale.set(100)
 position_scale.grid(column=2, row=1, columnspan=3)
 
-ttk.Button(mainframe, text="Engage", command=engage).grid(column=1, row=2, sticky=W)
-ttk.Button(mainframe, text="Disengage", command=disengage).grid(column=2, row=2, sticky=W)
-ttk.Button(mainframe, text="Reset", command=reset).grid(column=3, row=2, sticky=W)
+ttk.Button(mainframe, text="Engage", command=engage).grid(column=1, row=2)
+ttk.Button(mainframe, text="Disengage", command=disengage).grid(column=2, row=2)
+ttk.Button(mainframe, text="Reset", command=reset).grid(column=3, row=2)
 
 ttk.Label(mainframe, text="Flags:").grid(column=1, row=3, sticky=W)
 flags_var = StringVar()

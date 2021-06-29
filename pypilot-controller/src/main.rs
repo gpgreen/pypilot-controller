@@ -3,6 +3,7 @@
 #![no_std]
 #![no_main]
 #![feature(abi_avr_interrupt)]
+#![feature(llvm_asm)]
 
 extern crate panic_halt;
 
@@ -10,7 +11,7 @@ use avr_device::interrupt;
 use core::cell::RefCell;
 use core::convert::TryInto;
 use core::ptr;
-use hal::port::mode::{Floating, Input, Output, Pwm};
+use hal::port::mode::{Floating, Input, Output, PullUp, Pwm};
 use pypilot_controller_board::hal;
 use pypilot_controller_board::prelude::*;
 use pypilot_controller_board::pwm::{Prescaler, Timer0Pwm};
@@ -66,6 +67,12 @@ impl Flags {
 /// using low or high current
 const LOWCURRENT: bool = true;
 
+/// maximum current allowed
+const MAX_CURRENT: u16 = 2000; // 20 amps
+const MAX_VOLTAGE: u16 = 1600; // 16 volts max in 12 volt mode
+const MAX_CONTROLLER_TEMP: u16 = 7000; // 70C
+const MAX_MOTOR_TEMP: u16 = 7000; // 70C
+
 //==========================================================
 
 /// command to execute
@@ -93,11 +100,13 @@ pub struct State {
     timer2: pypilot_controller_board::pac::TC2,
     adc: RefCell<avr_device::atmega328p::ADC>,
     led_pin: RefCell<Option<hal::port::portb::PB5<Output>>>,
-    ena_pin: hal::port::portd::PD4<Input<Floating>>,
-    enb_pin: hal::port::portd::PD5<Input<Floating>>,
+    ena_pin: hal::port::portd::PD4<Input<PullUp>>,
+    enb_pin: hal::port::portd::PD5<Input<PullUp>>,
     ina_pin: hal::port::portd::PD2<Output>,
     inb_pin: hal::port::portd::PD3<Output>,
     pwm_pin: hal::port::portd::PD6<Pwm<Timer0Pwm>>,
+    stbd_stop_pin: hal::port::portd::PD7<Input<PullUp>>,
+    port_stop_pin: hal::port::portb::PB0<Input<PullUp>>,
     wdt: hal::wdt::Wdt,
     eeprom: avr_device::atmega328p::EEPROM,
     // state stuff
@@ -159,6 +168,7 @@ fn main() -> ! {
         ) {
             state.comm_timeout = 0;
         }
+        state.wdt.feed();
 
         state = process_fsm(state);
 
@@ -228,7 +238,21 @@ impl From<PyPilotStateMachine> for u8 {
 /// setup the hardware for the main loop
 fn setup() -> State {
     let dp = pypilot_controller_board::Peripherals::take().unwrap();
+    let flags = Flags::empty();
 
+    /*
+        // read fuses, and report this as flag if they are wrong
+        let fuse = dp.FUSE;
+        let low_fuse = fuse.low.read().bits();
+        let high_fuse = fuse.high.read().bits();
+        let extended_fuse = fuse.extended.read().bits();
+        if (low_fuse != 0xFF && low_fuse != 0x7f)
+            || (high_fuse != 0xDA && high_fuse != 0xDE)
+            || (extended_fuse != 0xFD && extended_fuse != 0xFC)
+        {
+            flags.insert(Flags::BADFUSES);
+        }
+    */
     // turn off unused modules
     let cpu = dp.CPU;
     cpu.prr.write(|w| {
@@ -245,9 +269,8 @@ fn setup() -> State {
     // sort out the pins
     let mut pins = pypilot_controller_board::Pins::new(dp.PORTB, dp.PORTC, dp.PORTD);
 
-    // turn on pullups on unused pins
-    pins.d7.into_pull_up_input(&mut pins.ddr);
-    pins.d8.into_pull_up_input(&mut pins.ddr);
+    let stbd_stop_pin = pins.d7.into_pull_up_input(&mut pins.ddr);
+    let port_stop_pin = pins.d8.into_pull_up_input(&mut pins.ddr);
 
     #[cfg(not(debug_assertions))]
     #[cfg(not(feature = "serial_packets"))]
@@ -270,8 +293,8 @@ fn setup() -> State {
 
     // half-bridge fault pins, also enable pins, but carrier has them pulled high
     // already
-    let ena_pin = pins.d4.into_floating_input(&mut pins.ddr);
-    let enb_pin = pins.d5.into_floating_input(&mut pins.ddr);
+    let ena_pin = pins.d4.into_pull_up_input(&mut pins.ddr);
+    let enb_pin = pins.d5.into_pull_up_input(&mut pins.ddr);
 
     // SPI pins
     let mut led = pins.d13.into_output(&mut pins.ddr);
@@ -324,9 +347,8 @@ fn setup() -> State {
     });
 
     // setup adc_results, and enable interrupts
+    interrupt::free(|cs| ADC_RESULTS.setup(&cs));
     unsafe {
-        // SAFETY: ok because interrupts aren't yet on
-        ADC_RESULTS.setup();
         interrupt::enable();
     }
 
@@ -344,6 +366,8 @@ fn setup() -> State {
         ina_pin: ina_pin,
         inb_pin: inb_pin,
         pwm_pin: pwm_pin,
+        stbd_stop_pin: stbd_stop_pin,
+        port_stop_pin: port_stop_pin,
         adc: RefCell::new(adc),
         led_pin: RefCell::new(Some(led)),
         wdt: watchdog,
@@ -366,7 +390,7 @@ fn setup() -> State {
         max_motor_temp: 7000,
         rudder_min: 0,
         rudder_max: 65535,
-        flags: Flags::empty(),
+        flags: flags,
         pending_cmd: CommandToExecute::None,
         outgoing_state: OutgoingPacketState::None,
     }
@@ -472,6 +496,111 @@ fn stop(state: &mut State) {
 
 //==========================================================
 
+#[inline]
+fn housekeeping(state: &mut State) {
+    let mut do_stop = false;
+
+    /*
+    // rudder_stop_checks
+    if state.stbd_stop_pin.is_low().void_unwrap() {
+        state.flags.insert(Flags::STBDPINFAULT);
+        do_stop = true;
+    } else {
+        state.flags.remove(Flags::STBDPINFAULT);
+    }
+    if state.port_stop_pin.is_low().void_unwrap() {
+        state.flags.insert(Flags::PORTPINFAULT);
+        do_stop = true;
+    } else {
+        state.flags.remove(Flags::PORTPINFAULT);
+    }
+
+    // test fault pins
+    if state.ena_pin.is_low().void_unwrap() || state.enb_pin.is_low().void_unwrap() {
+        state.flags.insert(Flags::OVERCURRENTFAULT);
+        do_stop = true;
+    } else {
+        state.flags.remove(Flags::OVERCURRENTFAULT);
+    }
+        // test current
+        let cnt;
+        unsafe {
+            cnt = ADC_RESULTS.count(adc::AdcChannel::Current, 1);
+        }
+        if cnt > 400 {
+            let amps;
+            unsafe {
+                amps = ADC_RESULTS.take_amps(1);
+            }
+            if amps >= MAX_CURRENT {
+                do_stop = true;
+                state.flags.insert(Flags::OVERCURRENTFAULT);
+            } else {
+                state.flags.remove(Flags::OVERCURRENTFAULT);
+            }
+        }
+    */
+    // stop if asked
+    if do_stop {
+        stop(state);
+    }
+}
+
+/*
+//==========================================================
+
+/// test voltage
+fn test_voltage(state: &mut State) {
+    /*
+        let cnt;
+        unsafe {
+            cnt = ADC_RESULTS.count(adc::AdcChannel::Voltage, 1);
+        }
+        if cnt > 400 {
+            let volts;
+            unsafe {
+                volts = ADC_RESULTS.take_volts(1);
+            }
+            if volts <= 900 || volts >= MAX_VOLTAGE {
+                stop(state);
+                state.flags.insert(Flags::BADVOLTAGEFAULT);
+            } else {
+                state.flags.remove(Flags::BADVOLTAGEFAULT);
+            }
+        }
+    */
+}
+ */
+
+//==========================================================
+
+/// test motor or controller temp
+#[cfg(any(feature = "motor_temp", feature = "controller_temp"))]
+fn test_overtemp(state: &mut State) {
+    let ccnt;
+    let mcnt;
+    unsafe {
+        ccnt = ADC_RESULTS.count(adc::AdcChannel::ControllerTemp, 1);
+        mcnt = ADC_RESULTS.count(adc::AdcChannel::MotorTemp, 1);
+    }
+    if ccnt > 100 && mcnt > 100 {
+        let ctemp;
+        let mtemp;
+        unsafe {
+            ctemp = ADC_RESULTS.take_controller_temp(1);
+            mtemp = ADC_RESULTS.take_motor_temp(1);
+        }
+        if ctemp >= MAX_CONTROLLER_TEMP || mtemp > MAX_MOTOR_TEMP {
+            stop(state);
+            state.flags.insert(Flags::OVERTEMPFAULT);
+        } else {
+            state.flags.remove(Flags::OVERTEMPFAULT);
+        }
+    }
+}
+
+//==========================================================
+
 /// update the pwm based on motor command
 fn position(state: &mut State, value: u16) {
     // foPWM = fclk/(prescale*256),prescale=8
@@ -503,9 +632,8 @@ fn process_fsm(mut state: State) -> State {
     // if motor position to be updated
     // timer2 is set to 1024 prescale, so each timer tick=15625hz=64ns
     // that means each update is at 5ms
-    let do_update = interrupt::free(|_cs| {
-        let ticks = state.timer2.tcnt2.read().bits();
-        if ticks > 78 {
+    let do_update = {
+        if state.timer2.tcnt2.read().bits() > 78 {
             state.timeout += 1;
             state.comm_timeout += 1;
             unsafe {
@@ -515,7 +643,11 @@ fn process_fsm(mut state: State) -> State {
         } else {
             false
         }
-    });
+    };
+
+    if do_update {
+        housekeeping(&mut state);
+    }
 
     // process packet
     match state.pending_cmd {
@@ -628,7 +760,6 @@ fn process_fsm(mut state: State) -> State {
                 }
                 position(&mut state, new_pos);
             }
-
             if state.timeout > 30 || state.pending_cmd == CommandToExecute::Disengage {
                 change_state(PyPilotStateMachine::DisengageEntry, state.machine_state)
             } else {
@@ -661,10 +792,10 @@ fn process_fsm(mut state: State) -> State {
             change_state(PyPilotStateMachine::Detach, state.machine_state)
         }
         PyPilotStateMachine::Detach => {
-            if state.timeout > 62 && state.comm_timeout > 250 {
-                change_state(PyPilotStateMachine::PowerDown, state.machine_state)
-            } else if state.pending_cmd == CommandToExecute::Engage {
+            if state.pending_cmd == CommandToExecute::Engage {
                 change_state(PyPilotStateMachine::Engage, state.machine_state)
+            } else if state.timeout > 62 && state.comm_timeout > 250 {
+                change_state(PyPilotStateMachine::PowerDown, state.machine_state)
             } else {
                 state.machine_state
             }
@@ -673,7 +804,7 @@ fn process_fsm(mut state: State) -> State {
             // cpu goes to sleep, then woken up
             power_down_mode(&mut state);
             state.timeout = 0;
-            state.comm_timeout = state.comm_timeout - 250;
+            state.comm_timeout -= 250;
             state.command_value = 1000;
             state.lastpos = 1000;
             state.flags.clear();
@@ -698,6 +829,8 @@ fn process_fsm(mut state: State) -> State {
         ina_pin: state.ina_pin,
         inb_pin: state.inb_pin,
         pwm_pin: state.pwm_pin,
+        stbd_stop_pin: state.stbd_stop_pin,
+        port_stop_pin: state.port_stop_pin,
         adc: state.adc,
         led_pin: state.led_pin,
         wdt: state.wdt,
@@ -733,4 +866,4 @@ fn PCINT2() {
     }
 }
 
-//==========================================================
+//=====================================================

@@ -2,6 +2,7 @@ use crate::{
     adc::AdcChannel, eeprom::eeprom_read8, eeprom::eeprom_update8, CommandToExecute, Flags, State,
     ADC_RESULTS, LOWCURRENT,
 };
+use avr_device::interrupt;
 use core::convert::TryFrom;
 
 //==========================================================
@@ -120,44 +121,44 @@ static mut EEPROM_END_ADDR: u8 = 0;
 //==========================================================
 
 fn build_current_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
-    unsafe {
-        if ADC_RESULTS.count(AdcChannel::Current, 0) < 50 {
+    interrupt::free(|cs| {
+        if ADC_RESULTS.count(&cs, AdcChannel::Current, 0) < 50 {
             false
         } else {
             *pkt_type = PacketType::CurrentCode;
-            *value = ADC_RESULTS.take_amps(0);
+            *value = ADC_RESULTS.take_amps(&cs, 0);
             true
         }
-    }
+    })
 }
 
 //==========================================================
 
 fn build_voltage_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
-    unsafe {
-        if ADC_RESULTS.count(AdcChannel::Voltage, 0) < 2 {
+    interrupt::free(|cs| {
+        if ADC_RESULTS.count(&cs, AdcChannel::Voltage, 0) < 2 {
             false
         } else {
             *pkt_type = PacketType::VoltageCode;
-            *value = ADC_RESULTS.take_volts(0);
+            *value = ADC_RESULTS.take_volts(&cs, 0);
             true
         }
-    }
+    })
 }
 
 //==========================================================
 
 #[cfg(feature = "motor_temp")]
 fn build_motor_temp_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
-    unsafe {
-        if ADC_RESULTS.count(AdcChannel::MotorTemp, 0) > 0 {
+    interrupt::free(|cs| {
+        if ADC_RESULTS.count(&cs, AdcChannel::MotorTemp, 0) > 0 {
             *pkt_type = PacketType::MotorTempCode;
-            *value = ADC_RESULTS.take_motor_temp(0);
+            *value = ADC_RESULTS.take_motor_temp(&cs, 0);
             true
         } else {
             false
         }
-    }
+    })
 }
 
 #[cfg(not(feature = "motor_temp"))]
@@ -193,7 +194,7 @@ fn build_rudder_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
         if ADC_RESULTS.count(AdcChannel::Rudder, 0) < 10 {
             false
         } else {
-            *pkt_type = PacketType::Rudder;
+            *pkt_type = PacketType::RudderSenseCode;
             *value = ADC_RESULTS.take_rudder(0);
             true
         }
@@ -287,6 +288,7 @@ pub fn process_packet(pkt: [u8; 3], state: &mut State) {
             PacketType::EEPROMWriteCode => eeprom_update8(&state, pkt[1] as u16, pkt[2]),
             PacketType::ReprogramCode => {}
             PacketType::ResetCode => state.flags.remove(Flags::OVERCURRENTFAULT),
+            // this isn't used
             PacketType::RudderRangeCode => {}
             _ => {}
         },
