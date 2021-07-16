@@ -16,8 +16,8 @@ elif [ "$1" = "--release" ]; then
 fi
 
 TARGET="$(realpath --relative-to="$(pwd)" "$(dirname "$0")/target")"
-HEX="$TARGET/$1.hex"
 ELF="$(echo "$TARGET"/avr-*/"$BUILD/$1.elf")"
+HEX="${ELF%elf}"hex 
 
 if [ ! -e "$ELF" ]; then
     echo "No $1.elf found.  The following binaries exist:" >&2

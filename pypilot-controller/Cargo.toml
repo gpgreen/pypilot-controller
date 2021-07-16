@@ -15,23 +15,20 @@ rudder_stops = []
 default = ["serial_packets","rudder_stops"]
 
 [dependencies]
-panic-halt = "0.2.0"
-avr-device = "0.3.0"
-heapless = "0.7.1"
+avr-device = "0.3"
 bitflags = "1.2"
+embedded-hal = "0.2.3"
+heapless = "0.7"
+panic-halt = "0.2.0"
 
-[dependencies.pypilot-controller-board]
-version = "0.1.0"
-path = "../pypilot_controller_board"
+[dependencies.arduino-hal]
+git = "https://github.com/Rahix/avr-hal"
+rev = "c503373c2b334a41d74b63a052133f5f484040c7"
+features = ["arduino-nano"]
 
 [dependencies.avr-hal-generic]
 git = "https://github.com/Rahix/avr-hal"
-rev = "885e8ec6d6d2fe34f26a1e2697a99f41092f0985"
-
-[dependencies.atmega328p-hal]
-git = "https://github.com/Rahix/avr-hal"
-rev = "885e8ec6d6d2fe34f26a1e2697a99f41092f0985"
-features = ["atmega328p"]
+rev = "c503373c2b334a41d74b63a052133f5f484040c7"
 
 # the following is a hack for link error during debug builds
 # rust-lang/compiler-builtins#347

@@ -1,142 +1,138 @@
 use crate::crc;
 use crate::packet::{OutgoingPacketState, PacketType};
 use crate::{CommandToExecute, Flags, State};
-use avr_device::interrupt;
-use avr_device::interrupt::Mutex;
-use core::cell::RefCell;
-use core::ptr;
-use hal::port::mode::{Floating, Input, Output};
-use heapless::spsc::{Consumer, Producer, Queue};
-use pypilot_controller_board::hal;
-use pypilot_controller_board::prelude::*;
+use arduino_hal::{
+    clock,
+    hal::{
+        port,
+        port::{mode, Pin},
+        usart::Event,
+    },
+};
+use avr_device::{
+    interrupt,
+    interrupt::{CriticalSection, Mutex},
+};
+use core::{
+    cell::Cell,
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use embedded_hal::serial::{Read, Write};
+use heapless::spsc::Queue;
 
-type Serial = pypilot_controller_board::hal::usart::Usart<
-    pypilot_controller_board::pac::USART0,
-    hal::port::portd::PD0<Input<Floating>>,
-    hal::port::portd::PD1<Output>,
-    hal::clock::MHz16,
->;
-type SerialWriter = pypilot_controller_board::hal::usart::UsartWriter<
-    pypilot_controller_board::pac::USART0,
-    hal::port::portd::PD0<Input<Floating>>,
-    hal::port::portd::PD1<Output>,
-    hal::clock::MHz16,
->;
-type SerialReader = pypilot_controller_board::hal::usart::UsartReader<
-    pypilot_controller_board::pac::USART0,
-    hal::port::portd::PD0<Input<Floating>>,
-    hal::port::portd::PD1<Output>,
-    hal::clock::MHz16,
->;
 //==========================================================
 
-// static variables for moving Producer, Consumer into their functions
+type Serial = arduino_hal::hal::usart::Usart<
+    arduino_hal::pac::USART0,
+    Pin<mode::Input, port::PD0>,
+    Pin<mode::Output, port::PD1>,
+    clock::MHz16,
+>;
+
+type SerialReader = arduino_hal::hal::usart::UsartReader<
+    arduino_hal::pac::USART0,
+    Pin<mode::Input, port::PD0>,
+    Pin<mode::Output, port::PD1>,
+    clock::MHz16,
+>;
+
+type SerialWriter = arduino_hal::hal::usart::UsartWriter<
+    arduino_hal::pac::USART0,
+    Pin<mode::Input, port::PD0>,
+    Pin<mode::Output, port::PD1>,
+    clock::MHz16,
+>;
+
+//==========================================================
+
+/// queue for bytes received on uart
+static mut READ_QUEUE: Queue<u8, 64> = Queue::new();
+/// queue for bytes to send on uart
+static mut WRITE_QUEUE: Queue<u8, 128> = Queue::new();
+/// flag for read queue overflow
+static mut READ_OVF: AtomicBool = AtomicBool::new(false);
+/// flag for write queue overflow
+static mut WRITE_OVF: AtomicBool = AtomicBool::new(false);
 
 /// used in USART_RX isr
-static mut READ_PROD_QUEUE: Mutex<RefCell<Option<Producer<u8, 64>>>> =
-    Mutex::new(RefCell::new(None));
-/// used in get_next_byte
-static mut READ_CONSUME_QUEUE: Option<Consumer<u8, 64>> = None;
-/// used in transmit_bytes
-static mut WRITE_PROD_QUEUE: Mutex<RefCell<Option<Producer<u8, 64>>>> =
-    Mutex::new(RefCell::new(None));
+static mut USARTREADER: Mutex<Cell<Option<SerialReader>>> = Mutex::new(Cell::new(None));
 /// used in USART_UDRE isr
-static mut WRITE_CONSUME_QUEUE: Mutex<RefCell<Option<Consumer<u8, 64>>>> =
-    Mutex::new(RefCell::new(None));
-/// used in isr
-static mut USARTREADER: Mutex<RefCell<Option<SerialReader>>> = Mutex::new(RefCell::new(None));
-/// used in isr
-static mut USARTWRITER: Mutex<RefCell<Option<SerialWriter>>> = Mutex::new(RefCell::new(None));
+static mut USARTWRITER: Mutex<Cell<Option<SerialWriter>>> = Mutex::new(Cell::new(None));
 
-/// utility function for getting next available byte received on USART
-#[inline]
-fn get_next_byte() -> Option<u8> {
-    // SAFETY: dequeue is a lockless function
+//==========================================================
+
+/// initialize the queues and populate the static structures
+pub fn init(cs: &CriticalSection, mut uart: Serial) {
+    // turn on RX and UDRE interrupt
+    uart.listen(Event::RxComplete);
+    uart.listen(Event::DataRegisterEmpty);
+
+    // split into reader and write and send to static variables
+    let (reader, writer) = uart.split();
+    // SAFETY: the queues are in a interrupt::free context so access is safe
     unsafe {
-        if let Some(q) = &mut READ_CONSUME_QUEUE {
-            q.dequeue()
-        } else {
-            None
-        }
+        USARTREADER.borrow(cs).replace(Some(reader));
+        USARTWRITER.borrow(cs).replace(Some(writer));
     }
 }
 
-/// utility function for putting bytes into transmit queue for USART
-#[inline]
-fn transmit_bytes(bytes: &[u8]) -> usize {
+//==========================================================
+
+/// get the next byte, if available, from the read queue
+pub fn get_next_byte(_cs: &CriticalSection) -> Option<u8> {
+    // SAFETY: inside of critical section
+    unsafe { READ_QUEUE.split().1.dequeue() }
+}
+
+//==========================================================
+
+/// send bytes to the write queue, returns number of bytes put on queue
+pub fn transmit_bytes(_cs: &CriticalSection, bytes: &[u8]) -> usize {
     let mut count: usize = 0;
-    // SAFETY: queue in a interrupt::free context so access is safe
-    unsafe {
-        interrupt::free(|cs| {
-            match WRITE_PROD_QUEUE.borrow(cs).borrow_mut().as_mut() {
-                Some(q) => {
-                    if q.len() == 0 {
-                        ptr::write_volatile(0xC6 as *mut u8, bytes[0]);
-                        count = 1;
-                        for b in bytes[1..].iter() {
-                            match q.enqueue(*b) {
-                                Ok(()) => count += 1,
-                                Err(_) => break,
-                            }
-                        }
-                    } else {
-                        for b in bytes.iter() {
-                            match q.enqueue(*b) {
-                                Ok(()) => count += 1,
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                }
-                None => {}
-            };
-            // turn on UDRE interrupt
-            ptr::write_volatile(0xC1 as *mut u8, 0xb8);
-        });
+    for b in bytes.iter() {
+        // SAFETY: inside of critical section
+        match unsafe { WRITE_QUEUE.split().0.enqueue(*b) } {
+            Ok(()) => count += 1,
+            // SAFETY: inside a critical section
+            Err(_) => unsafe { WRITE_OVF.store(true, Ordering::Relaxed) },
+        }
     }
+    // SAFETY: inside critical section
+    // turn on UDRE interrupt
+    unsafe { ptr::write_volatile(0xC1 as *mut u8, 0xb8) };
     count
 }
 
 //==========================================================
 
-/// setup the queues, move them into the static variables so they can be moved into the fns
-pub fn setup_serial(mut serial: Serial) {
-    static mut READ_QUEUE: Queue<u8, 64> = Queue::new();
-    static mut WRITE_QUEUE: Queue<u8, 64> = Queue::new();
-
-    serial.listen(hal::usart::Event::RxComplete);
-    serial.listen(hal::usart::Event::DataRegisterEmpty);
-    // split into reader and write and send to static variables
-    let (reader, writer) = serial.split();
-
-    // SAFETY: the queues are in a interrupt::free context so access is safe
-    unsafe {
-        interrupt::free(|cs| {
-            let (rdwr, rdrd) = READ_QUEUE.split();
-            let (wrwr, wrrd) = WRITE_QUEUE.split();
-
-            READ_CONSUME_QUEUE.replace(rdrd);
-            READ_PROD_QUEUE.borrow(cs).replace(Some(rdwr));
-            WRITE_CONSUME_QUEUE.borrow(cs).replace(Some(wrrd));
-            WRITE_PROD_QUEUE.borrow(cs).replace(Some(wrwr));
-            USARTREADER.borrow(cs).replace(Some(reader));
-            USARTWRITER.borrow(cs).replace(Some(writer));
-        });
-    }
+/// has the read queue overflowed
+pub fn read_overflow() -> bool {
+    // SAFETY: read of u8 should be safe
+    unsafe { READ_OVF.load(Ordering::Relaxed) }
 }
+
+//==========================================================
+
+/// has the write queue overflowed
+pub fn write_overflow() -> bool {
+    // SAFETY: read of u8 should be safe
+    unsafe { WRITE_OVF.load(Ordering::Relaxed) }
+}
+
+//==========================================================
 
 /// if outgoing state says to send a packet, do so
 #[inline]
-pub fn send_serial(outgoing_state: &mut OutgoingPacketState) {
+pub fn send_serial(outgoing_state: OutgoingPacketState) {
     // process outgoing packet if necessary
-    *outgoing_state = match *outgoing_state {
-        OutgoingPacketState::None => OutgoingPacketState::None,
-        OutgoingPacketState::Build => OutgoingPacketState::Build,
+    match outgoing_state {
         OutgoingPacketState::Send(pkt) => {
-            transmit_bytes(&[pkt[0], pkt[1], pkt[2], crc::crc8(pkt)]);
-            OutgoingPacketState::None
+            let cr = crc::crc8(pkt);
+            interrupt::free(|cs| transmit_bytes(&cs, &[pkt[0], pkt[1], pkt[2], cr]));
         }
-    };
+        _ => {}
+    }
 }
 
 /// check for incoming bytes, convert to packets if possible
@@ -150,57 +146,49 @@ pub fn process_serial(
     outgoing_state: &mut OutgoingPacketState,
 ) -> bool {
     static mut IN_BYTES: [u8; 3] = [0; 3];
-    static mut SYNC_B: usize = 0;
+    static mut SYNC_B: u8 = 0;
     static mut IN_SYNC_COUNT: u8 = 0;
 
-    // if there are no bytes waiting, return
-    unsafe {
-        if let Some(q) = &READ_CONSUME_QUEUE {
-            if !q.ready() {
-                return false;
-            }
-        };
+    // check overflow flags
+    if read_overflow() {
+        flags.insert(Flags::READQUEUEOVF);
     }
-
+    if write_overflow() {
+        flags.insert(Flags::WRITEQUEUEOVF);
+    }
     let mut reset_comm_timeout = false;
-    for _i in 0..3 {
-        if let Some(word) = get_next_byte() {
-            // reset the serial timeout now, since we've received data
-            //state.comm_timeout = 0;
-            reset_comm_timeout = true;
-            // SAFETY: this is safe because none of these static structures are modified
-            // elsewhere, they are only used here in this function
-            unsafe {
-                if SYNC_B < 3 {
-                    IN_BYTES[SYNC_B] = word;
-                    SYNC_B += 1;
-                } else {
-                    let pkt_crc = crc::crc8(IN_BYTES);
-                    if word == pkt_crc {
-                        SYNC_B = 0;
-                        if IN_SYNC_COUNT >= 2 {
-                            *pending_cmd = CommandToExecute::ProcessPacket(IN_BYTES);
-                        } else {
-                            IN_SYNC_COUNT += 1;
-                        }
-                        flags.insert(Flags::SYNC);
-                        flags.remove(Flags::INVALID);
-                        *outgoing_state = OutgoingPacketState::Build;
+    if let Some(word) = interrupt::free(|cs| get_next_byte(&cs)) {
+        // reset the serial timeout now, since we've received data
+        reset_comm_timeout = true;
+        // SAFETY: this is safe because none of these static structures are modified
+        // elsewhere, they are only used here in this function
+        unsafe {
+            if SYNC_B < 3 {
+                IN_BYTES[SYNC_B as usize] = word;
+                SYNC_B += 1;
+            } else {
+                let pkt_crc = crc::crc8(IN_BYTES);
+                if word == pkt_crc {
+                    SYNC_B = 0;
+                    if IN_SYNC_COUNT >= 2 {
+                        *pending_cmd = CommandToExecute::ProcessPacket(IN_BYTES);
                     } else {
-                        // invalid packet
-                        IN_SYNC_COUNT = 0;
-                        IN_BYTES[0] = IN_BYTES[1];
-                        IN_BYTES[1] = IN_BYTES[2];
-                        IN_BYTES[2] = word;
-                        flags.remove(Flags::SYNC);
-                        flags.insert(Flags::INVALID);
-                        //*outgoing_state = OutgoingPacketState::Build;
-                        *pending_cmd = CommandToExecute::Stop;
+                        IN_SYNC_COUNT += 1;
                     }
+                    flags.insert(Flags::SYNC);
+                    flags.remove(Flags::INVALID);
+                    *outgoing_state = OutgoingPacketState::Build;
+                } else {
+                    // invalid packet
+                    IN_SYNC_COUNT = 0;
+                    IN_BYTES[0] = IN_BYTES[1];
+                    IN_BYTES[1] = IN_BYTES[2];
+                    IN_BYTES[2] = word;
+                    flags.remove(Flags::SYNC);
+                    flags.insert(Flags::INVALID);
+                    *pending_cmd = CommandToExecute::Stop;
                 }
             }
-        } else {
-            break;
         }
     }
     reset_comm_timeout
@@ -214,13 +202,17 @@ pub fn send_tuple(state: &mut State /*, state: (PyPilotStateMachine, PyPilotStat
     let ty = PacketType::CurrentFSM.into();
     let pkt: [u8; 3] = [ty, state.machine_state.0.into(), 0x00];
     let crc: [u8; 1] = [crc::crc8(pkt)];
-    transmit_bytes(&pkt);
-    transmit_bytes(&crc);
+    interrupt::free(|cs| {
+        transmit_bytes(&cs, &pkt);
+        transmit_bytes(&cs, &crc);
+    });
     let ty = PacketType::PreviousFSM.into();
     let pkt = [ty, state.machine_state.1.into(), 0x00];
     let crc = [crc::crc8(pkt)];
-    transmit_bytes(&pkt);
-    transmit_bytes(&crc);
+    interrupt::free(|cs| {
+        transmit_bytes(&cs, &pkt);
+        transmit_bytes(&cs, &crc);
+    });
 }
 
 //==========================================================
@@ -228,11 +220,10 @@ pub fn send_tuple(state: &mut State /*, state: (PyPilotStateMachine, PyPilotStat
 #[interrupt(atmega328p)]
 unsafe fn USART_UDRE() {
     static mut WTR: Option<SerialWriter> = None;
-    static mut CQ: Option<Consumer<u8, 64>> = None;
-    // if usart writer has been moved here, use it
-    if let Some(wtr) = &mut WTR {
-        if let Some(cq) = &mut CQ {
-            match cq.dequeue() {
+    interrupt::free(|cs| {
+        // if usart writer has been moved here, use it
+        if let Some(wtr) = &mut WTR {
+            match WRITE_QUEUE.split().1.dequeue() {
                 Some(word) => match wtr.write(word) {
                     Ok(()) => {}
                     Err(_) => {}
@@ -242,18 +233,12 @@ unsafe fn USART_UDRE() {
                     ptr::write_volatile(0xC1 as *mut u8, 0x98);
                 }
             }
-        } else {
-            interrupt::free(|cs| {
-                CQ.replace(WRITE_CONSUME_QUEUE.borrow(cs).replace(None).unwrap());
-            })
         }
-    }
-    // otherwise move the writer into this isr
-    else {
-        interrupt::free(|cs| {
+        // otherwise move the writer into this isr
+        else {
             WTR.replace(USARTWRITER.borrow(cs).replace(None).unwrap());
-        })
-    }
+        }
+    })
 }
 
 //==========================================================
@@ -262,36 +247,22 @@ unsafe fn USART_UDRE() {
 unsafe fn USART_RX() {
     // the usart reader
     static mut RDR: Option<SerialReader> = None;
-    static mut PQ: Option<Producer<u8, 64>> = None;
-    // with the sequence of moving 2 functions into this isr, we will lose
-    // some words, but that is ok, the controller will keep sending them
-    // if USARTREADER has been moved into exception handler, use it
-    if let Some(rdr) = &mut RDR {
-        match rdr.read() {
-            Ok(word) => {
-                // if read producer here, use it
-                if let Some(pq) = &mut PQ {
-                    match pq.enqueue(word) {
-                        Ok(()) => {}
-                        Err(_) => {}
-                    }
-                }
-                // otherwise move it into this isr
-                else {
-                    interrupt::free(|cs| {
-                        PQ.replace(READ_PROD_QUEUE.borrow(cs).replace(None).unwrap());
-                    })
-                }
-            }
-            Err(_) => {}
+    interrupt::free(|cs| {
+        // if reader moved here, use it
+        if let Some(rdr) = &mut RDR {
+            match rdr.read() {
+                Ok(word) => match READ_QUEUE.split().0.enqueue(word) {
+                    Ok(()) => {}
+                    Err(_) => READ_OVF.store(true, Ordering::Relaxed),
+                },
+                Err(_) => {}
+            };
         }
-    }
-    // otherwise move it out of the Mutex pretected shared region to here
-    else {
-        interrupt::free(|cs| {
+        // otherwise move the usart reader into this isr
+        else {
             RDR.replace(USARTREADER.borrow(cs).replace(None).unwrap());
-        })
-    }
+        }
+    })
 }
 
 //==========================================================

@@ -16,8 +16,8 @@ elif [ "$1" = "--release" ]; then
 fi
 
 TARGET="$(realpath --relative-to="$(pwd)" "$(dirname "$0")/target")"
-LSS="$TARGET/$1.lss"
 ELF="$(echo "$TARGET"/avr-*/"$BUILD/$1.elf")"
+LSS="${ELF%elf}"lss
 
 if [ ! -e "$ELF" ]; then
     echo "No $1.elf found.  The following binaries exist:" >&2

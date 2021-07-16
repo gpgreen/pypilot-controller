@@ -1,8 +1,7 @@
 use crate::{
-    adc::AdcChannel, eeprom::eeprom_read8, eeprom::eeprom_update8, CommandToExecute, Flags, State,
-    ADC_RESULTS, LOWCURRENT,
+    adc::AdcMvgAvgIndex, eeprom::eeprom_read8, eeprom::eeprom_update8, CommandToExecute, Flags,
+    State, LOWCURRENT,
 };
-use avr_device::interrupt;
 use core::convert::TryFrom;
 
 //==========================================================
@@ -120,89 +119,87 @@ static mut EEPROM_END_ADDR: u8 = 0;
 
 //==========================================================
 
-fn build_current_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
-    interrupt::free(|cs| {
-        if ADC_RESULTS.count(&cs, AdcChannel::Current, 0) < 50 {
-            false
-        } else {
-            *pkt_type = PacketType::CurrentCode;
-            *value = ADC_RESULTS.take_amps(&cs, 0);
-            true
-        }
-    })
+fn build_current_pkt(state: &mut State, value: &mut u16, pkt_type: &mut PacketType) -> bool {
+    if let Some(avg) = state.adc_results.get_current(50, AdcMvgAvgIndex::First) {
+        *pkt_type = PacketType::CurrentCode;
+        *value = avg;
+        true
+    } else {
+        false
+    }
 }
 
 //==========================================================
 
-fn build_voltage_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
-    interrupt::free(|cs| {
-        if ADC_RESULTS.count(&cs, AdcChannel::Voltage, 0) < 2 {
-            false
-        } else {
-            *pkt_type = PacketType::VoltageCode;
-            *value = ADC_RESULTS.take_volts(&cs, 0);
-            true
-        }
-    })
+fn build_voltage_pkt(state: &mut State, value: &mut u16, pkt_type: &mut PacketType) -> bool {
+    if let Some(avg) = state.adc_results.get_voltage(2, AdcMvgAvgIndex::First) {
+        *pkt_type = PacketType::VoltageCode;
+        *value = avg;
+        true
+    } else {
+        false
+    }
 }
 
 //==========================================================
 
 #[cfg(feature = "motor_temp")]
-fn build_motor_temp_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
-    interrupt::free(|cs| {
-        if ADC_RESULTS.count(&cs, AdcChannel::MotorTemp, 0) > 0 {
-            *pkt_type = PacketType::MotorTempCode;
-            *value = ADC_RESULTS.take_motor_temp(&cs, 0);
-            true
-        } else {
-            false
-        }
-    })
+fn build_motor_temp_pkt(state: &mut State, value: &mut u16, pkt_type: &mut PacketType) -> bool {
+    if let Some(avg) = state.adc_results.get_motor_temp(1, AdcMvgAvgIndex::First) {
+        *pkt_type = PacketType::MotorTempCode;
+        *value = avg;
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(not(feature = "motor_temp"))]
-fn build_motor_temp_pkt(_value: &mut u16, _pkt_type: &mut PacketType) -> bool {
+fn build_motor_temp_pkt(_state: &mut State, _value: &mut u16, _pkt_type: &mut PacketType) -> bool {
     false
 }
 
 //==========================================================
 
 #[cfg(feature = "controller_temp")]
-fn build_controller_temp_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
-    unsafe {
-        if ADC_RESULTS.count(AdcChannel::ControllerTemp, 0) > 0 {
-            *pkt_type = PacketType::ControllerTempCode;
-            *value = ADC_RESULTS.take_controller_temp(0);
-            true
-        } else {
-            false
-        }
+fn build_controller_temp_pkt(
+    state: &mut State,
+    value: &mut u16,
+    pkt_type: &mut PacketType,
+) -> bool {
+    if let Some(avg) = state.adc_results.get_motor_temp(1, AdcMvgAvgIndex::First) {
+        *pkt_type = PacketType::ControllerTempCode;
+        *value = avg;
+        true
+    } else {
+        false
     }
 }
 
 #[cfg(not(feature = "controller_temp"))]
-fn build_controller_temp_pkt(_value: &mut u16, _pkt_type: &mut PacketType) -> bool {
+fn build_controller_temp_pkt(
+    _state: &mut State,
+    _value: &mut u16,
+    _pkt_type: &mut PacketType,
+) -> bool {
     false
 }
 
 //==========================================================
 
 #[cfg(feature = "rudder_angle")]
-fn build_rudder_pkt(value: &mut u16, pkt_type: &mut PacketType) -> bool {
-    unsafe {
-        if ADC_RESULTS.count(AdcChannel::Rudder, 0) < 10 {
-            false
-        } else {
-            *pkt_type = PacketType::RudderSenseCode;
-            *value = ADC_RESULTS.take_rudder(0);
-            true
-        }
+fn build_rudder_pkt(state: &mut State, value: &mut u16, pkt_type: &mut PacketType) -> bool {
+    if let Some(avg) = state.adc_results.get_rudder(10, AdcMvgAvgIndex::First) {
+        *pkt_type = PacketType::RudderCode;
+        *value = avg;
+        true
+    } else {
+        false
     }
 }
 
 #[cfg(not(feature = "rudder_angle"))]
-fn build_rudder_pkt(_value: &mut u16, _pkt_type: &mut PacketType) -> bool {
+fn build_rudder_pkt(_state: &mut State, _value: &mut u16, _pkt_type: &mut PacketType) -> bool {
     false
 }
 
@@ -306,7 +303,7 @@ pub enum OutgoingPacketState {
 }
 
 /// build a new packet to send
-pub fn build_outgoing(state: &State) -> OutgoingPacketState {
+pub fn build_outgoing(state: &mut State) -> OutgoingPacketState {
     // which position in the cycle
     static mut OUT_SYNC_POS: u8 = 0;
 
@@ -328,14 +325,14 @@ pub fn build_outgoing(state: &State) -> OutgoingPacketState {
             true
         }
         1 | 4 | 7 | 11 | 14 | 17 | 21 | 24 | 27 | 31 | 34 | 37 | 40 => {
-            build_current_pkt(&mut value, &mut pkt_type)
+            build_current_pkt(state, &mut value, &mut pkt_type)
         }
-        3 | 13 | 23 | 33 => build_voltage_pkt(&mut value, &mut pkt_type),
+        3 | 13 | 23 | 33 => build_voltage_pkt(state, &mut value, &mut pkt_type),
         2 | 5 | 8 | 12 | 15 | 18 | 22 | 25 | 28 | 32 | 35 | 38 | 41 => {
-            build_rudder_pkt(&mut value, &mut pkt_type)
+            build_rudder_pkt(state, &mut value, &mut pkt_type)
         }
-        6 => build_controller_temp_pkt(&mut value, &mut pkt_type),
-        9 => build_motor_temp_pkt(&mut value, &mut pkt_type),
+        6 => build_controller_temp_pkt(state, &mut value, &mut pkt_type),
+        9 => build_motor_temp_pkt(state, &mut value, &mut pkt_type),
         16 | 26 | 36 => {
             // SAFETY: these statics are only used in main loop sequence
             unsafe {

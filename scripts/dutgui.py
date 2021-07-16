@@ -86,6 +86,10 @@ def handle_recvd_pkt(pkt):
             flags.append("BADFUSE")
         if val & 0x1000:
             flags.append("REBOOT")
+        if val & 0x2000:
+            flags.append("READOVF")
+        if val & 0x4000:
+            flags.append("WRITEOVF")
         s += "Flags: {}".format(" ".join(flags))
         flags_var.set("".join(flags))
     elif pkt[0] == 0x9a:
@@ -107,7 +111,7 @@ def calc_crc8(msg):
     
 def open_serial():
     global serial_port
-    s = serial.Serial("/dev/ttyUSB0", 115200, timeout=0)
+    s = serial.Serial("/dev/ttyUSB0", 57600, timeout=0)
     s.close()
     s.open()
     serial_port = s

@@ -3,31 +3,68 @@
 #![no_std]
 #![no_main]
 #![feature(abi_avr_interrupt)]
-#![feature(llvm_asm)]
 
-extern crate panic_halt;
+#[cfg(not(debug_assertions))]
+use panic_halt as _;
 
+use arduino_hal::hal::{
+    pac, port,
+    port::{mode, Pin},
+};
 use avr_device::interrupt;
-use core::cell::RefCell;
-use core::convert::TryInto;
-use core::ptr;
-use hal::port::mode::{Floating, Input, Output, PullUp, Pwm};
-use pypilot_controller_board::hal;
-use pypilot_controller_board::prelude::*;
-use pypilot_controller_board::pwm::{Prescaler, Timer0Pwm};
-use pypilot_controller_board::wdt::{Timeout, Wdt};
+use avr_hal_generic::pwm::Prescaler;
+use core::{convert::TryInto, ptr};
 
 // modules from project
 mod adc;
-use adc::ADC_RESULTS;
+use adc::{AdcMvgAvgIndex, AdcResults};
 #[macro_use]
 extern crate bitflags;
 mod crc;
 mod packet;
 use packet::OutgoingPacketState;
 mod eeprom;
+mod nanopwm;
+use nanopwm::PwmPin;
 #[cfg(feature = "serial_packets")]
 mod serial;
+
+#[panic_handler]
+fn panic(_pi: &core::panic::PanicInfo<'_>) -> ! {
+    unsafe {
+        if let Some(led1) = &mut LED1_PIN {
+            led1.set_low();
+        }
+        if let Some(led2) = &mut LED2_PIN {
+            led2.set_low();
+        }
+        if let Some(led3) = &mut LED3_PIN {
+            led3.set_low();
+        }
+        if let Some(led4) = &mut LED4_PIN {
+            if adc::sample_overflow() {
+                led4.set_high();
+            } else {
+                led4.set_low();
+            }
+        }
+        if let Some(led5) = &mut LED5_PIN {
+            if serial::write_overflow() {
+                led5.set_high();
+            } else {
+                led5.set_low();
+            }
+        }
+        if let Some(led6) = &mut LED6_PIN {
+            if serial::read_overflow() {
+                led6.set_high();
+            } else {
+                led6.set_low();
+            }
+        }
+    }
+    loop {}
+}
 
 //==========================================================
 // Hardware.flags
@@ -47,6 +84,8 @@ bitflags! {
     const CURRENTRANGE = 0b0000_0100_0000_0000;
     const BADFUSES = 0b0000_1000_0000_0000;
     const REBOOTED = 0b0001_0000_0000_0000;
+    const READQUEUEOVF = 0b0010_0000_0000_0000;
+    const WRITEQUEUEOVF = 0b0100_0000_0000_0000;
     }
 }
 
@@ -94,20 +133,19 @@ pub enum CommandToExecute {
 /// the state variables for the hardware
 pub struct State {
     // hardware stuff
-    cpu: pypilot_controller_board::pac::CPU,
-    exint: pypilot_controller_board::pac::EXINT,
-    timer0: pypilot_controller_board::pwm::Timer0Pwm,
-    timer2: pypilot_controller_board::pac::TC2,
-    adc: RefCell<avr_device::atmega328p::ADC>,
-    led_pin: RefCell<Option<hal::port::portb::PB5<Output>>>,
-    ena_pin: hal::port::portd::PD4<Input<PullUp>>,
-    enb_pin: hal::port::portd::PD5<Input<PullUp>>,
-    ina_pin: hal::port::portd::PD2<Output>,
-    inb_pin: hal::port::portd::PD3<Output>,
-    pwm_pin: hal::port::portd::PD6<Pwm<Timer0Pwm>>,
-    stbd_stop_pin: hal::port::portd::PD7<Input<PullUp>>,
-    port_stop_pin: hal::port::portb::PB0<Input<PullUp>>,
-    wdt: hal::wdt::Wdt,
+    cpu: arduino_hal::pac::CPU,
+    exint: arduino_hal::pac::EXINT,
+    timer0: nanopwm::Timer0Pwm,
+    timer2: arduino_hal::pac::TC2,
+    //ena_pin: Pin<mode::Input<mode::PullUp>, port::PD4>,
+    //enb_pin: Pin<mode::Input<mode::PullUp>, port::PD5>,
+    //ina_pin: Pin<mode::Output, port::PD2>,
+    //inb_pin: Pin<mode::Output, port::PD3>,
+    pwm_pin: nanopwm::PwmPin<Pin<mode::Output, port::PD6>>,
+    //stbd_stop_pin: Pin<mode::Input<mode::PullUp>, port::PD7>,
+    //port_stop_pin: Pin<mode::Input<mode::PullUp>, port::PB0>,
+    //    wdt: hal::wdt::Wdt,
+    wdt: avr_device::atmega328p::WDT,
     eeprom: avr_device::atmega328p::EEPROM,
     // state stuff
     machine_state: (PyPilotStateMachine, PyPilotStateMachine),
@@ -127,38 +165,46 @@ pub struct State {
     flags: Flags,
     pending_cmd: CommandToExecute,
     outgoing_state: OutgoingPacketState,
+    adc_results: AdcResults,
 }
 
 //==========================================================
 
-#[hal::entry]
+static mut LED1_PIN: Option<Pin<mode::Output, port::PB5>> = None;
+static mut LED2_PIN: Option<Pin<mode::Output, port::PB0>> = None;
+static mut LED3_PIN: Option<Pin<mode::Output, port::PD7>> = None;
+static mut LED4_PIN: Option<Pin<mode::Output, port::PD5>> = None;
+static mut LED5_PIN: Option<Pin<mode::Output, port::PD4>> = None;
+static mut LED6_PIN: Option<Pin<mode::Output, port::PD3>> = None;
+static mut LED7_PIN: Option<Pin<mode::Output, port::PD2>> = None;
+
+//==========================================================
+
+#[arduino_hal::entry]
 fn main() -> ! {
     let mut state = setup();
-    let mut led_cnt = 0;
-    let mut led_on = true;
-    static mut LED: Option<hal::port::portb::PB5<Output>> = None;
 
     loop {
-        state.wdt.feed();
-        unsafe {
-            if let Some(led) = &mut LED {
-                if led_cnt == 100 {
-                    led_cnt = 0;
-                    if led_on {
-                        led.set_low().void_unwrap();
-                        led_on = false;
-                    } else {
-                        led.set_high().void_unwrap();
-                        led_on = true;
-                    }
-                } else {
-                    led_cnt += 1;
-                }
-            } else {
-                LED.replace(state.led_pin.replace(None).unwrap());
-            }
+        avr_device::asm::wdr();
+        //state.wdt.feed();
+        // check for watchdog interrupt
+        if unsafe { ptr::read_volatile(&WDT_TRIGGERED) } {
+            interrupt::free(|_| {
+                // follow timed sequence, to change the wdt
+                state
+                    .wdt
+                    .wdtcsr
+                    .modify(|_, w| w.wdce().set_bit().wde().set_bit());
+                // set reset enabled, and to 32K cycles
+                state
+                    .wdt
+                    .wdtcsr
+                    //                    .write(|w| w.wde().set_bit().wdpl().cycles_32k());
+                    .write(|w| w.wde().set_bit());
+                // loop until reset
+                loop {}
+            });
         }
-
         // in serial processing
         #[cfg(feature = "serial_packets")]
         if serial::process_serial(
@@ -168,13 +214,12 @@ fn main() -> ! {
         ) {
             state.comm_timeout = 0;
         }
-        state.wdt.feed();
-
         state = process_fsm(state);
+        state.adc_results.process();
 
         // out serial processing
         #[cfg(feature = "serial_packets")]
-        serial::send_serial(&mut state.outgoing_state);
+        serial::send_serial(state.outgoing_state);
     }
 }
 
@@ -237,7 +282,7 @@ impl From<PyPilotStateMachine> for u8 {
 
 /// setup the hardware for the main loop
 fn setup() -> State {
-    let dp = pypilot_controller_board::Peripherals::take().unwrap();
+    let dp = arduino_hal::Peripherals::take().unwrap();
     let flags = Flags::empty();
 
     /*
@@ -267,57 +312,62 @@ fn setup() -> State {
     ac.acsr.write(|w| w.acd().set_bit());
 
     // sort out the pins
-    let mut pins = pypilot_controller_board::Pins::new(dp.PORTB, dp.PORTC, dp.PORTD);
+    let pins = arduino_hal::pins!(dp);
 
-    let stbd_stop_pin = pins.d7.into_pull_up_input(&mut pins.ddr);
-    let port_stop_pin = pins.d8.into_pull_up_input(&mut pins.ddr);
+    //let stbd_stop_pin = pins.d7.into_pull_up_input();
+    //let port_stop_pin = pins.d8.into_pull_up_input();
 
     #[cfg(not(debug_assertions))]
     #[cfg(not(feature = "serial_packets"))]
-    pins.rx.into_pull_up_input(&mut pins.ddr);
+    pins.d0.into_pull_up_input();
     #[cfg(not(debug_assertions))]
     #[cfg(not(feature = "serial_packets"))]
-    pins.tx.into_pull_up_input(&mut pins.ddr);
+    pins.d1.into_pull_up_input();
 
     // turn on timer2
     let timer2 = dp.TC2;
     timer2.tccr2b.modify(|_, w| w.cs2().prescale_1024());
 
     // pwm
-    let mut timer0 = Timer0Pwm::new(dp.TC0, Prescaler::Prescale8);
-    let pwm_pin = pins.d6.into_output(&mut pins.ddr).into_pwm(&mut timer0);
+    let mut timer0 = nanopwm::Timer0Pwm::new(dp.TC0, Prescaler::Prescale8);
+    let pwm_pin = PwmPin::into_pwm(pins.d6.into_output(), &mut timer0);
     // clockwise
-    let ina_pin = pins.d2.into_output(&mut pins.ddr);
+    let ina_pin = pins.d2.into_output();
     // counterclockwise
-    let inb_pin = pins.d3.into_output(&mut pins.ddr);
+    let inb_pin = pins.d3.into_output();
 
     // half-bridge fault pins, also enable pins, but carrier has them pulled high
     // already
-    let ena_pin = pins.d4.into_pull_up_input(&mut pins.ddr);
-    let enb_pin = pins.d5.into_pull_up_input(&mut pins.ddr);
+    //let ena_pin = pins.d4.into_pull_up_input();
+    //let enb_pin = pins.d5.into_pull_up_input();
 
     // SPI pins
-    let mut led = pins.d13.into_output(&mut pins.ddr);
-    led.set_high().void_unwrap();
-
     //let _sck = pins.d13.into_pull_up_input(&mut pins.ddr);
-    let _miso = pins.d12.into_output(&mut pins.ddr);
-    let _mosi = pins.d11.into_pull_up_input(&mut pins.ddr);
-    let _cs = pins.d10.into_pull_up_input(&mut pins.ddr);
-    let _can_int = pins.d9.into_floating_input(&mut pins.ddr);
+    let _miso = pins.d12.into_output();
+    let _mosi = pins.d11.into_pull_up_input();
+    let _cs = pins.d10.into_pull_up_input();
+    let _can_int = pins.d9.into_floating_input();
 
+    // debugging pins
+    unsafe {
+        LED1_PIN = Some(pins.d13.into_output());
+        LED2_PIN = Some(pins.d8.into_output());
+        LED3_PIN = Some(pins.d7.into_output());
+        LED4_PIN = Some(pins.d5.into_output());
+        LED5_PIN = Some(pins.d4.into_output());
+        LED6_PIN = Some(inb_pin);
+        LED7_PIN = Some(ina_pin);
+        if let Some(led2) = &mut LED2_PIN {
+            led2.set_high();
+        }
+    }
     // now module setup
 
     // setup serial
     #[cfg(feature = "serial_packets")]
-    let uart0 = pypilot_controller_board::Serial::<Floating>::new(
-        dp.USART0,
-        pins.rx,
-        pins.tx.into_output(&mut pins.ddr),
-        115200.into_baudrate(),
-    );
+    let uart = arduino_hal::default_serial!(dp, pins, 57600);
     #[cfg(feature = "serial_packets")]
-    serial::setup_serial(uart0);
+    interrupt::free(|cs| serial::init(&cs, uart));
 
     // setup adc, not using the HAL, because it doesn't do interrupts
     let adc = dp.ADC;
@@ -346,31 +396,42 @@ fn setup() -> State {
             .set_bit()
     });
 
-    // setup adc_results, and enable interrupts
-    interrupt::free(|cs| ADC_RESULTS.setup(&cs));
-    unsafe {
-        interrupt::enable();
-    }
+    // setup adc_results
+    let mut adc_results = AdcResults::new();
+    interrupt::free(|cs| adc_results.init(&cs, adc));
 
     // watchdog
-    let mut watchdog = Wdt::new(&cpu.mcusr, dp.WDT);
-    watchdog.start(Timeout::Ms250);
+    let wdt = dp.WDT;
+    interrupt::free(|_cs| {
+        cpu.mcusr.modify(|_, w| w.wdrf().clear_bit());
+        avr_device::asm::wdr();
+        // follow timed sequence to change wdt
+        wdt.wdtcsr.modify(|_, w| w.wdce().set_bit().wde().set_bit());
+        // no watchdog reset, set watchdog interrupt
+        wdt.wdtcsr
+            .write(|w| w.wde().clear_bit().wdie().set_bit().wdpl().cycles_32k());
+    });
+
+    unsafe {
+        if let Some(led3) = &mut LED3_PIN {
+            led3.set_high();
+        }
+        interrupt::enable();
+    }
 
     State {
         cpu: cpu,
         exint: dp.EXINT,
         timer0: timer0,
         timer2: timer2,
-        ena_pin: ena_pin,
-        enb_pin: enb_pin,
-        ina_pin: ina_pin,
-        inb_pin: inb_pin,
+        //ena_pin: ena_pin,
+        //enb_pin: enb_pin,
+        //ina_pin: ina_pin,
+        //inb_pin: inb_pin,
         pwm_pin: pwm_pin,
-        stbd_stop_pin: stbd_stop_pin,
-        port_stop_pin: port_stop_pin,
-        adc: RefCell::new(adc),
-        led_pin: RefCell::new(Some(led)),
-        wdt: watchdog,
+        //stbd_stop_pin: stbd_stop_pin,
+        //port_stop_pin: port_stop_pin,
+        wdt: wdt, //watchdog,
         eeprom: dp.EEPROM,
         machine_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
         prev_state: (PyPilotStateMachine::Start, PyPilotStateMachine::Start),
@@ -393,6 +454,7 @@ fn setup() -> State {
         flags: flags,
         pending_cmd: CommandToExecute::None,
         outgoing_state: OutgoingPacketState::None,
+        adc_results: adc_results,
     }
 }
 
@@ -402,14 +464,12 @@ fn setup() -> State {
 fn power_down_mode(state: &mut State) {
     // delay for a bit, so that usart can finish any transmission
     #[cfg(any(debug_assertions, feature = "serial_packets"))]
-    pypilot_controller_board::delay_ms(10);
+    arduino_hal::delay_ms(10);
 
     // disable modules
     // adc off
-    state
-        .adc
-        .borrow_mut()
-        .adcsra
+    let adc = unsafe { &*<pac::ADC>::ptr() };
+    adc.adcsra
         .write(|w| w.aden().clear_bit().adif().clear_bit());
 
     // release hal serial which turns it off
@@ -425,7 +485,9 @@ fn power_down_mode(state: &mut State) {
         w.prtim2().set_bit();
         w.pradc().set_bit()
     });
-
+    if let Some(led6) = unsafe { &mut LED6_PIN } {
+        led6.toggle();
+    }
     // set PCINT2 interrupt
     unsafe {
         state.exint.pcicr.modify(|r, w| w.bits(r.bits() | 4));
@@ -474,7 +536,7 @@ fn power_down_mode(state: &mut State) {
     });
 
     // enable modules
-    state.adc.borrow_mut().adcsra.write(|w| {
+    adc.adcsra.write(|w| {
         w.aden()
             .set_bit()
             .adsc()
@@ -501,76 +563,52 @@ fn housekeeping(state: &mut State) {
     let mut do_stop = false;
 
     /*
-    // rudder_stop_checks
-    if state.stbd_stop_pin.is_low().void_unwrap() {
-        state.flags.insert(Flags::STBDPINFAULT);
-        do_stop = true;
-    } else {
-        state.flags.remove(Flags::STBDPINFAULT);
-    }
-    if state.port_stop_pin.is_low().void_unwrap() {
-        state.flags.insert(Flags::PORTPINFAULT);
-        do_stop = true;
-    } else {
-        state.flags.remove(Flags::PORTPINFAULT);
-    }
-
-    // test fault pins
-    if state.ena_pin.is_low().void_unwrap() || state.enb_pin.is_low().void_unwrap() {
-        state.flags.insert(Flags::OVERCURRENTFAULT);
-        do_stop = true;
-    } else {
-        state.flags.remove(Flags::OVERCURRENTFAULT);
-    }
-        // test current
-        let cnt;
-        unsafe {
-            cnt = ADC_RESULTS.count(adc::AdcChannel::Current, 1);
+        // rudder_stop_checks
+        if state.stbd_stop_pin.is_low() {
+            state.flags.insert(Flags::STBDPINFAULT);
+            do_stop = true;
+        } else {
+            state.flags.remove(Flags::STBDPINFAULT);
         }
-        if cnt > 400 {
-            let amps;
-            unsafe {
-                amps = ADC_RESULTS.take_amps(1);
-            }
-            if amps >= MAX_CURRENT {
-                do_stop = true;
-                state.flags.insert(Flags::OVERCURRENTFAULT);
-            } else {
-                state.flags.remove(Flags::OVERCURRENTFAULT);
-            }
+        if state.port_stop_pin.is_low() {
+            state.flags.insert(Flags::PORTPINFAULT);
+            do_stop = true;
+        } else {
+            state.flags.remove(Flags::PORTPINFAULT);
+        }
+
+        // test fault pins
+        if state.ena_pin.is_low() || state.enb_pin.is_low() {
+            state.flags.insert(Flags::OVERCURRENTFAULT);
+            do_stop = true;
+        } else {
+            state.flags.remove(Flags::OVERCURRENTFAULT);
         }
     */
-    // stop if asked
+    // test current
+    if let Some(amps) = state.adc_results.get_current(400, AdcMvgAvgIndex::Second) {
+        if amps >= MAX_CURRENT {
+            do_stop = true;
+            state.flags.insert(Flags::OVERCURRENTFAULT);
+        } else {
+            state.flags.remove(Flags::OVERCURRENTFAULT);
+        }
+    }
+    // test voltage
+    if let Some(volts) = state.adc_results.get_voltage(400, AdcMvgAvgIndex::Second) {
+        if volts <= 900 || volts >= MAX_VOLTAGE {
+            do_stop = true;
+            state.flags.insert(Flags::BADVOLTAGEFAULT);
+        } else {
+            state.flags.remove(Flags::BADVOLTAGEFAULT);
+        }
+    }
+
+    // schedule stop if asked
     if do_stop {
-        stop(state);
+        state.pending_cmd = CommandToExecute::Stop;
     }
 }
-
-/*
-//==========================================================
-
-/// test voltage
-fn test_voltage(state: &mut State) {
-    /*
-        let cnt;
-        unsafe {
-            cnt = ADC_RESULTS.count(adc::AdcChannel::Voltage, 1);
-        }
-        if cnt > 400 {
-            let volts;
-            unsafe {
-                volts = ADC_RESULTS.take_volts(1);
-            }
-            if volts <= 900 || volts >= MAX_VOLTAGE {
-                stop(state);
-                state.flags.insert(Flags::BADVOLTAGEFAULT);
-            } else {
-                state.flags.remove(Flags::BADVOLTAGEFAULT);
-            }
-        }
-    */
-}
- */
 
 //==========================================================
 
@@ -580,15 +618,15 @@ fn test_overtemp(state: &mut State) {
     let ccnt;
     let mcnt;
     unsafe {
-        ccnt = ADC_RESULTS.count(adc::AdcChannel::ControllerTemp, 1);
-        mcnt = ADC_RESULTS.count(adc::AdcChannel::MotorTemp, 1);
+        ccnt = AdcResults.count(adc::AdcChannel::ControllerTemp, 1);
+        mcnt = AdcResults.count(adc::AdcChannel::MotorTemp, 1);
     }
     if ccnt > 100 && mcnt > 100 {
         let ctemp;
         let mtemp;
         unsafe {
-            ctemp = ADC_RESULTS.take_controller_temp(1);
-            mtemp = ADC_RESULTS.take_motor_temp(1);
+            ctemp = AdcResults.take_controller_temp(1);
+            mtemp = AdcResults.take_motor_temp(1);
         }
         if ctemp >= MAX_CONTROLLER_TEMP || mtemp > MAX_MOTOR_TEMP {
             stop(state);
@@ -611,16 +649,35 @@ fn position(state: &mut State, value: u16) {
         (1000 - value) / 4
     };
     state.pwm_pin.set_duty(newpos.try_into().unwrap_or(0));
+    /*
     if value > 1040 {
-        state.ina_pin.set_low().unwrap();
-        state.inb_pin.set_high().unwrap();
+        state.ina_pin.set_low();
+        state.inb_pin.set_high();
     } else if value < 960 {
-        state.ina_pin.set_high().unwrap();
-        state.inb_pin.set_low().unwrap();
+        state.ina_pin.set_high();
+        state.inb_pin.set_low();
     } else {
         // set brake
-        state.ina_pin.set_low().unwrap();
-        state.inb_pin.set_low().unwrap();
+        state.ina_pin.set_low();
+        state.inb_pin.set_low();
+    }
+     */
+    unsafe {
+        if let Some(led4) = &mut LED4_PIN {
+            if let Some(led5) = &mut LED5_PIN {
+                if value > 1040 {
+                    led4.set_low();
+                    led5.set_high();
+                } else if value < 960 {
+                    led4.set_high();
+                    led5.set_low();
+                } else {
+                    // set brake
+                    led4.set_low();
+                    led5.set_low();
+                }
+            }
+        }
     }
 }
 
@@ -632,12 +689,23 @@ fn process_fsm(mut state: State) -> State {
     // if motor position to be updated
     // timer2 is set to 1024 prescale, so each timer tick=15625hz=64ns
     // that means each update is at 5ms
+    static mut LED_CNT: u8 = 0;
     let do_update = {
         if state.timer2.tcnt2.read().bits() > 78 {
             state.timeout += 1;
             state.comm_timeout += 1;
             unsafe {
-                state.timer2.tcnt2.modify(|r, w| w.bits(r.bits() - 78));
+                interrupt::free(|_| state.timer2.tcnt2.modify(|r, w| w.bits(r.bits() - 78)));
+            }
+            unsafe {
+                if LED_CNT == 100 {
+                    LED_CNT = 0;
+                    if let Some(led1) = &mut LED1_PIN {
+                        led1.toggle();
+                    }
+                } else {
+                    LED_CNT += 1;
+                }
             }
             true
         } else {
@@ -645,29 +713,25 @@ fn process_fsm(mut state: State) -> State {
         }
     };
 
+    // process packet
+    match state.pending_cmd {
+        CommandToExecute::ProcessPacket(pkt) => packet::process_packet(pkt, &mut state),
+        _ => {}
+    }
+
     if do_update {
         housekeeping(&mut state);
     }
 
-    // process packet
-    match state.pending_cmd {
-        CommandToExecute::ProcessPacket(pkt) => packet::process_packet(pkt, &mut state),
-        CommandToExecute::Stop => {
-            stop(&mut state);
-            state.pending_cmd = CommandToExecute::None;
-        }
-        _ => {}
-    }
-    // check for stop from process packet
+    // check for stop
     if state.pending_cmd == CommandToExecute::Stop {
         stop(&mut state);
     }
 
     // build outgoing packet if asked
     if state.outgoing_state == OutgoingPacketState::Build {
-        state.outgoing_state = packet::build_outgoing(&state);
+        state.outgoing_state = packet::build_outgoing(&mut state);
     }
-
     // FSM
     let newstate = match state.machine_state.0 {
         PyPilotStateMachine::Start => {
@@ -675,8 +739,8 @@ fn process_fsm(mut state: State) -> State {
         }
         PyPilotStateMachine::WaitEntry => {
             state.timeout = 0;
-            state.ina_pin.set_low().void_unwrap();
-            state.inb_pin.set_low().void_unwrap();
+            //state.ina_pin.set_low();
+            //state.inb_pin.set_low();
             change_state(PyPilotStateMachine::Wait, state.machine_state)
         }
         PyPilotStateMachine::Wait => {
@@ -692,8 +756,8 @@ fn process_fsm(mut state: State) -> State {
             state.timeout = 0;
             state.flags.insert(Flags::ENGAGED);
             // start PWM
-            state.ina_pin.set_low().void_unwrap();
-            state.ina_pin.set_low().void_unwrap();
+            //state.ina_pin.set_low();
+            //state.inb_pin.set_low();
             state.pwm_pin.set_duty(0);
             state.pwm_pin.enable();
             position(&mut state, 1000);
@@ -785,8 +849,8 @@ fn process_fsm(mut state: State) -> State {
             }
         }
         PyPilotStateMachine::DetachEntry => {
-            state.ina_pin.set_low().void_unwrap();
-            state.inb_pin.set_low().void_unwrap();
+            //state.ina_pin.set_low();
+            //state.inb_pin.set_low();
             state.pwm_pin.set_duty(0);
             state.pwm_pin.disable();
             change_state(PyPilotStateMachine::Detach, state.machine_state)
@@ -824,15 +888,13 @@ fn process_fsm(mut state: State) -> State {
         exint: state.exint,
         timer0: state.timer0,
         timer2: state.timer2,
-        ena_pin: state.ena_pin,
-        enb_pin: state.enb_pin,
-        ina_pin: state.ina_pin,
-        inb_pin: state.inb_pin,
+        //ena_pin: state.ena_pin,
+        //enb_pin: state.enb_pin,
+        //ina_pin: state.ina_pin,
+        //inb_pin: state.inb_pin,
         pwm_pin: state.pwm_pin,
-        stbd_stop_pin: state.stbd_stop_pin,
-        port_stop_pin: state.port_stop_pin,
-        adc: state.adc,
-        led_pin: state.led_pin,
+        //stbd_stop_pin: state.stbd_stop_pin,
+        //port_stop_pin: state.port_stop_pin,
         wdt: state.wdt,
         eeprom: state.eeprom,
         machine_state: newstate,
@@ -852,7 +914,36 @@ fn process_fsm(mut state: State) -> State {
         flags: state.flags,
         pending_cmd: state.pending_cmd,
         outgoing_state: state.outgoing_state,
+        adc_results: state.adc_results,
     }
+}
+
+//==========================================================
+
+static mut WDT_TRIGGERED: bool = false;
+
+#[interrupt(atmega328p)]
+fn WDT() {
+    unsafe {
+        ptr::write_volatile(&mut WDT_TRIGGERED, true);
+        if let Some(led7) = &mut LED7_PIN {
+            led7.set_high();
+        }
+    }
+    /*
+        wdt_reset();
+        wdt_disable();
+        if(!calculated_clock) {
+            calculated_clock = 1; // use watchdog interrupt once at startup to compute the crystal's frequency
+            return;
+        }
+        // normal watchdog event (program stuck)
+        disengage();
+        _delay_ms(50);
+        detach();
+
+        asm volatile ("ijmp" ::"z" (0x0000)); // soft reset
+    */
 }
 
 //==========================================================
